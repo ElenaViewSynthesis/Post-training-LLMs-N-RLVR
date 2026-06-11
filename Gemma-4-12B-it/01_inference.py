@@ -1,17 +1,29 @@
 """
 Gemma 4 — Basic Inference
 Covers: text, multimodal (audio, image, video) inputs, reasoning toggle.
+
+Cloud GPU (SSH) usage:
+    Single GPU:  CUDA_VISIBLE_DEVICES=0 python 01_inference.py
+    Multi-GPU:   CUDA_VISIBLE_DEVICES=0,1 python 01_inference.py
+    Specific ID: set GPU_ID env var, e.g. GPU_ID=1 python 01_inference.py
 """
 
+import os
+import torch
 from transformers import AutoProcessor, AutoModelForMultimodalLM
 
 MODEL_ID = "google/gemma-4-12B-it"
 
+# On cloud SSH nodes, pin to a specific GPU via GPU_ID or fall back to "auto"
+# which distributes across all GPUs visible to the process.
+_gpu = os.environ.get("GPU_ID")
+DEVICE_MAP = f"cuda:{_gpu}" if _gpu else "auto"
+
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 model = AutoModelForMultimodalLM.from_pretrained(
     MODEL_ID,
-    dtype="auto",
-    device_map="auto",
+    torch_dtype=torch.bfloat16,   # explicit bf16 — best for A100/H100
+    device_map=DEVICE_MAP,
 )
 
 
