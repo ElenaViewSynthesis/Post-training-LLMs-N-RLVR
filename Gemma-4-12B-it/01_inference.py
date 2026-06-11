@@ -10,9 +10,12 @@ Cloud GPU (SSH) usage:
 
 import os
 import torch
+from dotenv import load_dotenv
 from transformers import AutoProcessor, AutoModelForMultimodalLM
 
-MODEL_ID = "google/gemma-4-12B-it"
+load_dotenv()
+
+MODEL_ID = os.getenv("MODEL_ID", "google/gemma-4-12B-it")
 
 # On cloud SSH nodes, pin to a specific GPU via GPU_ID or fall back to "auto"
 # which distributes across all GPUs visible to the process.
