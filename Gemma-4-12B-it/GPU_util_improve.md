@@ -1,5 +1,17 @@
 # GPU Utilization — Observations and Improvement Notes
 
+## Sync Project to New Instance
+
+When you spin up a new Lambda instance, you'll need to sync the repo again:
+
+```bash
+rsync -av --exclude .venv --exclude .uv-cache --exclude .git \
+  /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/ \
+  ubuntu@NEW_INSTANCE_IP:~/Gemma-4-12B-it/
+```
+
+---
+
 ## Faster GPU Speed
 
 ```bash
