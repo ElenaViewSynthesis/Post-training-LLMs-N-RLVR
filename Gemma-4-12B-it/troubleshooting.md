@@ -93,20 +93,20 @@ If the script is missing or outdated on the instance, re-sync from local WSL fir
 **Copy a single file (faster for quick script updates):**
 ```bash
 scp /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/06_mitre_sft.py \
-  ubuntu@129.146.110.174:~/Gemma-4-12B-it/06_mitre_sft.py
+  ubuntu@132.226.76.207:~/Gemma-4-12B-it/06_mitre_sft.py
 ```
 
-> Replace `129.146.110.174` with the current instance IP if on a new machine.
+> Replace `132.226.76.207` with the current instance IP if on a new machine.
 
 **Or re-sync the full project:**
 
 ```bash
 rsync -av --exclude .venv --exclude .uv-cache --exclude .git \
   /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/ \
-  ubuntu@129.146.110.174:~/Gemma-4-12B-it/
+  ubuntu@132.226.76.207:~/Gemma-4-12B-it/
 ```
 
-> If you are on a different GPU instance, replace `129.146.110.174` with that instance's IP.
+> If you are on a different GPU instance, replace `132.226.76.207` with that instance's IP.
 
 Then on the Lambda SSH terminal:
 
@@ -141,4 +141,3 @@ Reattach later:
 ```bash
 tmux attach -t mitre-sft
 ```
-

@@ -67,12 +67,20 @@ cp .env.example .env
 LAMBDA_API_KEY=your_lambda_api_key
 LAMBDA_SSH_KEY_NAME=lambda-gpu          # name you gave the key on Lambda
 LAMBDA_SSH_KEY_PATH=~/.ssh/lambda_gpu   # path to the private key on your machine
+LAMBDA_INSTANCE_IP=132.226.76.207       # current running instance, for direct SSH
 ```
 
 **4. Launch and connect:**
 ```bash
 uv run lambda_gpu.py                        # launches default instance and SSHs in
 uv run lambda_gpu.py --type gpu_1x_h100_sxm4  # specific instance type
+```
+
+**Connect to the current running instance:**
+```bash
+ssh ubuntu@132.226.76.207
+ssh -i ~/.ssh/lambda_gpu ubuntu@132.226.76.207
+uv run lambda_gpu.py connect 132.226.76.207
 ```
 
 ---
@@ -168,7 +176,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py \
 **Sync the updated script to Lambda:**
 ```bash
 scp /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/06_mitre_sft.py \
-  ubuntu@129.146.110.174:~/Gemma-4-12B-it/06_mitre_sft.py
+  ubuntu@132.226.76.207:~/Gemma-4-12B-it/06_mitre_sft.py
 ```
 
 **On Lambda, verify tools are available:**
@@ -192,6 +200,19 @@ CUDA_VISIBLE_DEVICES=0 nsys profile \
   accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
 ```
 
+**Profiled smoke test (20 steps — run this first):**
+```bash
+CUDA_VISIBLE_DEVICES=0 nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none \
+  --cpuctxsw=none \
+  --force-overwrite=true \
+  -o profiles/nsys/mitre_sft_smoke \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 20
+```
+
+> **Why 2.3 GB is a red flag:** That's just 20 steps. Full training would produce a trace tens of GBs large — completely unusable. The `--max-steps 20` limit was the right call.
+
 **Run Nsight Compute (kernel-level metrics):**
 ```bash
 mkdir -p profiles/ncu
@@ -208,7 +229,7 @@ CUDA_VISIBLE_DEVICES=0 ncu \
 
 **Copy reports back to local machine:**
 ```bash
-scp -r ubuntu@129.146.110.174:~/Gemma-4-12B-it/profiles .
+scp -r ubuntu@132.226.76.207:~/Gemma-4-12B-it/profiles .
 ```
 
 ---
@@ -243,14 +264,14 @@ CUDA_VISIBLE_DEVICES=0 python 01_inference.py
 
 ---
 
-### SSH Connection to Lambda GPU — Established
+### Current Lambda GPU Endpoint
 
 ```
-ubuntu@129.146.110.174
+ubuntu@132.226.76.207
 Ubuntu 22.04.5 LTS — Linux 6.8.0-1046-nvidia x86_64
 Lambda GPU Cloud
 ```
 
-Connected via `lambda_gpu.py` using the configured `LAMBDA_SSH_KEY_PATH`. Instance is live and ready for model deployment.
+Connect with `ssh ubuntu@132.226.76.207` if your default SSH identity is registered with Lambda. Otherwise use `ssh -i ~/.ssh/lambda_gpu ubuntu@132.226.76.207` or set `LAMBDA_SSH_KEY_PATH` before running `lambda_gpu.py connect`.
 
 ![Lambda SSH Connection](assets/lambda-ssh-connection.png)

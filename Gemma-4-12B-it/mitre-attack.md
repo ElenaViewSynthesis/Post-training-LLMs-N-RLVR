@@ -125,7 +125,7 @@ CUDA_VISIBLE_DEVICES=0 ncu \
 Copy reports back to local WSL:
 
 ```bash
-scp -r ubuntu@129.146.110.174:~/Gemma-4-12B-it/profiles .
+scp -r ubuntu@132.226.76.207:~/Gemma-4-12B-it/profiles .
 ```
 
 ---

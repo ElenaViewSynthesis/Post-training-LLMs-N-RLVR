@@ -424,7 +424,7 @@ def main():
         args=sft_config,
         train_dataset=dataset,
         processing_class=tokenizer,
-        callbacks=[NvtxStepCallback()] if args.nvtx else None,
+        callbacks=[NvtxStepCallback()] if args.nvtx else [],
     )
     trainer.train()
     trainer.save_model(OUTPUT_DIR)

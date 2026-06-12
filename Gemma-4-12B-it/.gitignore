@@ -26,3 +26,6 @@ outputs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local-only docs
+lambda_connect.md

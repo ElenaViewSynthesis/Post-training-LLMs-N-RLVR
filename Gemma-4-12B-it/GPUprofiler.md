@@ -13,12 +13,27 @@ apt-cache search nsight
 ```
 
 **Install Nsight Systems:**
+
+Use the repo setup script on a new Lambda box. It installs `nsight-systems`,
+extracts a newer `libssh` under `~/nsys-libs`, and writes `~/nsys-libs/env.sh`.
+
 ```bash
-sudo apt install -y nsight-systems
+cd ~/Gemma-4-12B-it
+bash scripts/setup_lambda_nsight.sh
+source ~/nsys-libs/env.sh
+```
+
+Then verify:
+
+```bash
+which nsys
+nsys --version
 ```
 
 **Run Nsight Systems:**
 ```bash
+source ~/nsys-libs/env.sh
+
 CUDA_VISIBLE_DEVICES=0 nsys profile \
   --trace=cuda,nvtx,osrt \
   --sample=none \
@@ -42,10 +57,20 @@ CUDA_VISIBLE_DEVICES=0 ncu \
 
 **Copy reports back to local machine:**
 ```bash
-scp -r ubuntu@129.146.110.174:~/Gemma-4-12B-it/profiles .
+scp -r ubuntu@132.226.76.207:~/Gemma-4-12B-it/profiles .
 ```
 
 > **Rule:** never profile the entire training run with PyTorch Profiler or Nsight. Profile only a short window after warmup — otherwise traces become huge and slow.
+
+---
+
+## Smoke / profiling run
+
+Run a short smoke/profiling run first:
+
+```bash
+accelerate launch 06_mitre_sft.py --max-steps 20
+```
 
 ---
 
@@ -73,6 +98,7 @@ python 06_mitre_sft.py
 ```bash
 cd ~/Gemma-4-12B-it
 source .venv/bin/activate
+source ~/nsys-libs/env.sh
 mkdir -p profiles/nsys
 
 CUDA_VISIBLE_DEVICES=0 nsys profile \

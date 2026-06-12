@@ -4,6 +4,8 @@ Lambda Cloud — spin up a GPU instance and SSH into it.
 Usage:
     uv run lambda_gpu.py                        # launch default instance type
     uv run lambda_gpu.py --type gpu_1x_h100_sxm4
+    uv run lambda_gpu.py connect                # SSH to LAMBDA_INSTANCE_IP
+    uv run lambda_gpu.py connect 132.226.76.207 # SSH to an existing instance
     uv run lambda_gpu.py --list-types           # show available GPU types + prices
     uv run lambda_gpu.py --list                 # show your running instances
     uv run lambda_gpu.py --terminate <id>       # terminate an instance
@@ -23,7 +25,8 @@ load_dotenv()
 API_KEY = os.getenv("LAMBDA_API_KEY")
 SSH_KEY_NAME = os.getenv("LAMBDA_SSH_KEY_NAME")
 DEFAULT_INSTANCE_TYPE = os.getenv("LAMBDA_INSTANCE_TYPE", "gpu_1x_a100_sxm4")
-SSH_KEY_PATH = os.path.expanduser(os.getenv("LAMBDA_SSH_KEY_PATH", "~/.ssh/id_rsa"))
+SSH_KEY_PATH = os.getenv("LAMBDA_SSH_KEY_PATH", "")
+INSTANCE_IP = os.getenv("LAMBDA_INSTANCE_IP", "")
 
 BASE = "https://cloud.lambda.ai/api/v1"
 
@@ -123,11 +126,12 @@ def wait_until_running(instance_id: str, timeout: int = 300) -> dict:
 def ssh_into(ip: str):
     cmd = [
         "ssh",
-        "-i", SSH_KEY_PATH,
         "-o", "StrictHostKeyChecking=no",
         "-o", "ServerAliveInterval=60",
-        f"ubuntu@{ip}",
     ]
+    if SSH_KEY_PATH:
+        cmd.extend(["-i", os.path.expanduser(SSH_KEY_PATH)])
+    cmd.append(f"ubuntu@{ip}")
     print(f"Connecting: {' '.join(cmd)}\n")
     subprocess.run(cmd)
 
@@ -183,6 +187,14 @@ def cmd_launch(args):
         ssh_into(ip)
 
 
+def cmd_connect(args):
+    ip = args.ip or INSTANCE_IP
+    if not ip:
+        print("[error] Provide an IP address or set LAMBDA_INSTANCE_IP in .env.")
+        sys.exit(1)
+    ssh_into(ip)
+
+
 def cmd_terminate(args):
     check_env()
     terminate(args.id)
@@ -201,6 +213,9 @@ def main():
     p_launch.add_argument("--type", default=DEFAULT_INSTANCE_TYPE, help="Instance type name")
     p_launch.add_argument("--no-ssh", action="store_true", help="Don't SSH after launch")
 
+    p_connect = sub.add_parser("connect", help="SSH to an existing Lambda instance")
+    p_connect.add_argument("ip", nargs="?", help="Instance IP address; defaults to LAMBDA_INSTANCE_IP")
+
     p_term = sub.add_parser("terminate", help="Terminate an instance")
     p_term.add_argument("id", help="Instance ID")
 
@@ -212,6 +227,8 @@ def main():
         cmd_list_types(args)
     elif args.cmd == "terminate":
         cmd_terminate(args)
+    elif args.cmd == "connect":
+        cmd_connect(args)
     else:
         # default: launch
         args.type = getattr(args, "type", DEFAULT_INSTANCE_TYPE)
