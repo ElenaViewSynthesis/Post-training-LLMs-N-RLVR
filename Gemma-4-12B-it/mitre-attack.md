@@ -85,7 +85,7 @@ accelerate launch 06_mitre_sft.py --no-qlora
 | Batch size | 1 (+ 8 gradient accumulation steps) |
 | Learning rate | 2e-4 (cosine schedule) |
 | Max seq length | 2048 |
-| Packing | Enabled |
+| Packing | Disabled by default |
 | Optimizer | paged_adamw_8bit |
 | Output | `./gemma4-mitre-sft/` |
 

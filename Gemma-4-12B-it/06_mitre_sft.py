@@ -13,6 +13,7 @@ Dependencies:
 """
 
 import argparse
+import inspect
 import json
 import os
 import random
@@ -321,6 +322,15 @@ def format_sample(sample, tokenizer):
     }
 
 
+def build_sft_config(**kwargs) -> SFTConfig:
+    params = inspect.signature(SFTConfig).parameters
+    if "max_seq_length" in kwargs and "max_seq_length" not in params and "max_length" in params:
+        kwargs["max_length"] = kwargs.pop("max_seq_length")
+    if "max_length" in kwargs and "max_length" not in params and "max_seq_length" in params:
+        kwargs["max_seq_length"] = kwargs.pop("max_length")
+    return SFTConfig(**{k: v for k, v in kwargs.items() if k in params})
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -366,7 +376,7 @@ def main():
     model.print_trainable_parameters()
 
     # training
-    sft_config = SFTConfig(
+    sft_config = build_sft_config(
         output_dir=OUTPUT_DIR,
         num_train_epochs=3,
         per_device_train_batch_size=1,
@@ -380,8 +390,8 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         dataset_text_field="text",
-        max_seq_length=2048,
-        packing=True,
+        max_length=2048,
+        packing=False,
         report_to="wandb" if os.getenv("WANDB_API_KEY") else "none",
         run_name="gemma4-mitre-sft",
     )
