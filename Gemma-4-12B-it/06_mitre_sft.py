@@ -379,8 +379,8 @@ def main():
     sft_config = build_sft_config(
         output_dir=OUTPUT_DIR,
         num_train_epochs=3,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
         gradient_checkpointing=True,
         optim="paged_adamw_8bit" if use_qlora else "adamw_torch",
         learning_rate=2e-4,

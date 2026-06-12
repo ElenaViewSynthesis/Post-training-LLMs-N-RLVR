@@ -124,7 +124,12 @@ CUDA_VISIBLE_DEVICES=0 python 01_inference.py
 
 ### Running MITRE ATT&CK Fine-tuning
 
-Use tmux so training keeps running if the SSH session drops.
+**Run directly on the Lambda box:**
+```bash
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py
+```
+
+For long runs, use tmux so training keeps running if the SSH session drops.
 
 **Start a tmux session and launch training:**
 ```bash

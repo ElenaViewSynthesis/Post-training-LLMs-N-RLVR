@@ -88,7 +88,17 @@ cuda True
 
 ## 5. Sync Project and Restart Fine-Tuning
 
-If the script is missing or outdated on the instance, re-sync from local WSL first:
+If the script is missing or outdated on the instance, re-sync from local WSL first.
+
+**Copy a single file (faster for quick script updates):**
+```bash
+scp /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/06_mitre_sft.py \
+  ubuntu@129.146.110.174:~/Gemma-4-12B-it/06_mitre_sft.py
+```
+
+> Replace `129.146.110.174` with the current instance IP if on a new machine.
+
+**Or re-sync the full project:**
 
 ```bash
 rsync -av --exclude .venv --exclude .uv-cache --exclude .git \
