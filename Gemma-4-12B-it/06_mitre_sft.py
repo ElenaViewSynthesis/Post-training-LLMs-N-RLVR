@@ -366,7 +366,7 @@ def main():
 
     # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
-    dataset   = dataset.map(lambda s: format_sample(s, tokenizer))
+    dataset   = dataset.map(lambda s: format_sample(s, tokenizer), num_proc=4)
 
     # quantisation
     bnb_config = BitsAndBytesConfig(
@@ -395,8 +395,8 @@ def main():
     sft_config = build_sft_config(
         output_dir=OUTPUT_DIR,
         num_train_epochs=3,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=2,
         gradient_checkpointing=True,
         optim="paged_adamw_8bit" if use_qlora else "adamw_torch",
         learning_rate=2e-4,
@@ -409,6 +409,12 @@ def main():
         dataset_text_field="text",
         max_length=2048,
         packing=False,
+
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
+        #dataloader_prefetch_factor=2,
+
         report_to="wandb" if os.getenv("WANDB_API_KEY") else "none",
         run_name="gemma4-mitre-sft",
     )
