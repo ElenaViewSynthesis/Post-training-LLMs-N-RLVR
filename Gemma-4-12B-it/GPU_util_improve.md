@@ -1,5 +1,14 @@
 # GPU Utilization — Observations and Improvement Notes
 
+## Faster GPU Speed
+
+```bash
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py \
+  --attn-implementation flash_attention_2
+```
+
+---
+
 ## Current Run Status
 
 Estimated total runtime ~2h 45m. For Gemma 12B + QLoRA + 2048 token length + gradient checkpointing on a single GPU, that is expected.

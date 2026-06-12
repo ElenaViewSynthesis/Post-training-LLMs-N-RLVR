@@ -91,7 +91,46 @@ accelerate launch 06_mitre_sft.py --no-qlora
 
 ---
 
-## 5. After training
+## 5. Profiling
+
+Prefer Nsight Systems first for whole-training timeline analysis, then Nsight Compute for a small number of kernels.
+
+### Nsight Systems timeline
+
+```bash
+mkdir -p profiles/nsys
+CUDA_VISIBLE_DEVICES=0 nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none \
+  --cpuctxsw=none \
+  --force-overwrite=true \
+  -o profiles/nsys/mitre_sft_timeline \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
+```
+
+### Nsight Compute kernel metrics
+
+```bash
+mkdir -p profiles/ncu
+CUDA_VISIBLE_DEVICES=0 ncu \
+  --target-processes all \
+  --set basic \
+  --launch-skip 20 \
+  --launch-count 10 \
+  --force-overwrite \
+  -o profiles/ncu/mitre_sft_basic \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
+```
+
+Copy reports back to local WSL:
+
+```bash
+scp -r ubuntu@129.146.110.174:~/Gemma-4-12B-it/profiles .
+```
+
+---
+
+## 6. After training
 
 Merge the LoRA adapter into the base model and export:
 
@@ -111,7 +150,7 @@ model.push_to_hub('your-hf-username/gemma4-mitre-attack')
 
 ---
 
-## 6. Terminate the Lambda instance when done
+## 7. Terminate the Lambda instance when done
 
 ```bash
 python lambda_gpu.py list

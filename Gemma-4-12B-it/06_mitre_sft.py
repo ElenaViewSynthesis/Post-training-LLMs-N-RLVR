@@ -30,6 +30,7 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from trl import SFTConfig, SFTTrainer
+from transformers import TrainerCallback
 
 load_dotenv()
 
@@ -331,11 +332,26 @@ def build_sft_config(**kwargs) -> SFTConfig:
     return SFTConfig(**{k: v for k, v in kwargs.items() if k in params})
 
 
+class NvtxStepCallback(TrainerCallback):
+    def __init__(self):
+        self.enabled = torch.cuda.is_available()
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.enabled:
+            torch.cuda.nvtx.range_push(f"train_step_{state.global_step}")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.enabled:
+            torch.cuda.nvtx.range_pop()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-qlora", action="store_true", help="Use full-precision LoRA")
+    parser.add_argument("--max-steps", type=int, default=-1, help="Limit optimizer steps for profiling or smoke tests")
+    parser.add_argument("--nvtx", action="store_true", help="Add NVTX ranges around training steps for Nsight tools")
     parser.add_argument(
         "--attn-implementation",
         default=os.getenv("ATTN_IMPLEMENTATION"),
@@ -386,6 +402,7 @@ def main():
         learning_rate=2e-4,
         lr_scheduler_type="cosine",
         warmup_ratio=0.05,
+        max_steps=args.max_steps,
         bf16=True,
         logging_steps=10,
         save_strategy="epoch",
@@ -401,6 +418,7 @@ def main():
         args=sft_config,
         train_dataset=dataset,
         processing_class=tokenizer,
+        callbacks=[NvtxStepCallback()] if args.nvtx else None,
     )
     trainer.train()
     trainer.save_model(OUTPUT_DIR)

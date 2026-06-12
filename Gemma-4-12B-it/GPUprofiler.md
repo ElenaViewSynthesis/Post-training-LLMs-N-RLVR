@@ -1,6 +1,49 @@
 # GPU Profiler — Gemma 4 12B on Lambda Cloud
 
+```bash
+watch -n 1 nvidia-smi
+```
+
 Monitor and profile GPU usage during inference and fine-tuning runs on the Lambda A100 instance.
+
+**Check if Nsight tools are available on the instance:**
+```bash
+sudo apt update
+apt-cache search nsight
+```
+
+**Install Nsight Systems:**
+```bash
+sudo apt install -y nsight-systems
+```
+
+**Run Nsight Systems:**
+```bash
+CUDA_VISIBLE_DEVICES=0 nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none \
+  --cpuctxsw=none \
+  --force-overwrite=true \
+  -o profiles/nsys/mitre_sft_timeline \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
+```
+
+**Run Nsight Compute on a small kernel window:**
+```bash
+mkdir -p profiles/ncu
+
+CUDA_VISIBLE_DEVICES=0 ncu \
+  --target-processes all \
+  --launch-count 10 \
+  --force-overwrite \
+  -o profiles/ncu/mitre_sft_basic \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
+```
+
+**Copy reports back to local machine:**
+```bash
+scp -r ubuntu@129.146.110.174:~/Gemma-4-12B-it/profiles .
+```
 
 > **Rule:** never profile the entire training run with PyTorch Profiler or Nsight. Profile only a short window after warmup — otherwise traces become huge and slow.
 
@@ -23,6 +66,22 @@ mkdir -p profiles logs
 
 nvidia-smi dmon -s pucvmt > profiles/gpu_dmon.log &
 python 06_mitre_sft.py
+```
+
+### Stage 2 — Nsight Systems (run this first)
+
+```bash
+cd ~/Gemma-4-12B-it
+source .venv/bin/activate
+mkdir -p profiles/nsys
+
+CUDA_VISIBLE_DEVICES=0 nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none \
+  --cpuctxsw=none \
+  --force-overwrite=true \
+  -o profiles/nsys/mitre_sft_timeline \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
 ```
 
 ### Stage 3 — Nsight Systems (short window only)

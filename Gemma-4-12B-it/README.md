@@ -159,6 +159,60 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py \
 
 ---
 
+### Profiling with Nsight Systems and Nsight Compute
+
+**What changed in the codebase:**
+- `06_mitre_sft.py` — `--nvtx` flag adds NVTX ranges around training steps; `--max-steps` limits the run to a short profiling window
+- `mitre-attack.md` — added `nsys` and `ncu` profiling commands
+
+**Sync the updated script to Lambda:**
+```bash
+scp /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/06_mitre_sft.py \
+  ubuntu@129.146.110.174:~/Gemma-4-12B-it/06_mitre_sft.py
+```
+
+**On Lambda, verify tools are available:**
+```bash
+which nsys
+which ncu
+```
+
+**Run Nsight Systems (timeline trace):**
+```bash
+cd ~/Gemma-4-12B-it
+source .venv/bin/activate
+mkdir -p profiles/nsys
+
+CUDA_VISIBLE_DEVICES=0 nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none \
+  --cpuctxsw=none \
+  --force-overwrite=true \
+  -o profiles/nsys/mitre_sft_timeline \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
+```
+
+**Run Nsight Compute (kernel-level metrics):**
+```bash
+mkdir -p profiles/ncu
+
+CUDA_VISIBLE_DEVICES=0 ncu \
+  --target-processes all \
+  --set basic \
+  --launch-skip 20 \
+  --launch-count 10 \
+  --force-overwrite \
+  -o profiles/ncu/mitre_sft_basic \
+  accelerate launch --num_processes 1 06_mitre_sft.py --nvtx --max-steps 30
+```
+
+**Copy reports back to local machine:**
+```bash
+scp -r ubuntu@129.146.110.174:~/Gemma-4-12B-it/profiles .
+```
+
+---
+
 ### Troubleshooting — Project Folder Not Found on Instance
 
 If `cd ~/Gemma-4-12B-it` fails with "No such file or directory", the folder hasn't been synced yet.
