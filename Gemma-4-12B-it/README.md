@@ -161,3 +161,5 @@ Lambda GPU Cloud
 ```
 
 Connected via `lambda_gpu.py` using the configured `LAMBDA_SSH_KEY_PATH`. Instance is live and ready for model deployment.
+
+![Lambda SSH Connection](assets/lambda-ssh-connection.png)
