@@ -15,10 +15,12 @@ DEB_ARCH="$(dpkg --print-architecture)"
 case "$DEB_ARCH" in
   amd64)
     DEFAULT_LIBSSH_DEB_URL="https://archive.ubuntu.com/ubuntu/pool/main/libs/libssh/libssh-4_0.10.6-2build2_amd64.deb"
+    DEFAULT_LIBBPF_DEB_URL=""
     LIBSSH_MULTIARCH="x86_64-linux-gnu"
     ;;
   arm64)
     DEFAULT_LIBSSH_DEB_URL="https://ports.ubuntu.com/ubuntu-ports/pool/main/libs/libssh/libssh-4_0.10.6-2build2_arm64.deb"
+    DEFAULT_LIBBPF_DEB_URL=""
     LIBSSH_MULTIARCH="aarch64-linux-gnu"
     ;;
   *)
@@ -28,10 +30,14 @@ case "$DEB_ARCH" in
 esac
 
 LIBSSH_DEB_URL="${LIBSSH_DEB_URL:-$DEFAULT_LIBSSH_DEB_URL}"
+LIBBPF_DEB_URL="${LIBBPF_DEB_URL:-$DEFAULT_LIBBPF_DEB_URL}"
 LIBSSH_DEB_NAME="${LIBSSH_DEB_URL##*/}"
 LOCAL_LIBSSH_DIR="$NSYS_LIB_ROOT/usr/lib/$LIBSSH_MULTIARCH"
 LOCAL_LIBSSH_SO="$LOCAL_LIBSSH_DIR/libssh.so.4"
 ACTIVE_LIBSSH_DIR=""
+LOCAL_LIBBPF_DIR="$NSYS_LIB_ROOT/usr/lib/$LIBSSH_MULTIARCH"
+LOCAL_LIBBPF_SO="$LOCAL_LIBBPF_DIR/libbpf.so.1"
+ACTIVE_LIBBPF_DIR=""
 ENV_FILE="$NSYS_LIB_ROOT/env.sh"
 
 log() {
@@ -87,6 +93,28 @@ lib_has_symbol() {
   [[ -f "$libssh_so" ]] && strings "$libssh_so" | grep -q "$REQUIRED_LIBSSH_SYMBOL"
 }
 
+find_libbpf_so_1() {
+  local libbpf_so
+  libbpf_so="$(ldconfig -p 2>/dev/null | awk '/libbpf\.so\.1 / { print $NF; exit }')"
+  if [[ -n "$libbpf_so" && -f "$libbpf_so" ]]; then
+    printf '%s\n' "$libbpf_so"
+    return 0
+  fi
+
+  for libbpf_so in \
+    "/usr/lib/$LIBSSH_MULTIARCH/libbpf.so.1" \
+    /usr/lib/libbpf.so.1 \
+    "$LOCAL_LIBBPF_SO"
+  do
+    if [[ -f "$libbpf_so" ]]; then
+      printf '%s\n' "$libbpf_so"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 download() {
   local url="$1"
   local output="$2"
@@ -109,6 +137,35 @@ log "Detected Ubuntu architecture: $DEB_ARCH"
 log "Installing Nsight Systems if needed."
 sudo apt-get update
 sudo apt-get install -y nsight-systems binutils libssh-4
+
+if ! find_libbpf_so_1 >/dev/null; then
+  if apt-cache show libbpf1 >/dev/null 2>&1; then
+    sudo apt-get install -y libbpf1
+  else
+    log "libbpf1 is not available from the configured apt sources."
+  fi
+fi
+
+if ! find_libbpf_so_1 >/dev/null && [[ -n "$LIBBPF_DEB_URL" ]]; then
+  log "Installing libbpf locally under $NSYS_LIB_ROOT."
+  mkdir -p "$NSYS_LIB_ROOT"
+
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+
+  libbpf_deb_name="${LIBBPF_DEB_URL##*/}"
+  download "$LIBBPF_DEB_URL" "$tmpdir/$libbpf_deb_name"
+  dpkg-deb -x "$tmpdir/$libbpf_deb_name" "$NSYS_LIB_ROOT"
+fi
+
+LIBBPF_SO="$(find_libbpf_so_1 || true)"
+if [[ -n "$LIBBPF_SO" ]]; then
+  ACTIVE_LIBBPF_DIR="$(dirname "$LIBBPF_SO")"
+  log "Found libbpf.so.1: $LIBBPF_SO"
+else
+  log "WARNING: libbpf.so.1 was not found. nsys may fail to start."
+  log "If needed, rerun with LIBBPF_DEB_URL set to a libbpf1 .deb for $DEB_ARCH."
+fi
 
 if [[ -z "$NSYS_HOST_DIR" ]]; then
   if ! NSYS_HOST_DIR="$(detect_nsys_host_dir)"; then
@@ -152,11 +209,11 @@ if [[ -z "$ACTIVE_LIBSSH_DIR" ]]; then
   log "set LIBSSH_DEB_URL to a newer libssh-4 .deb for $DEB_ARCH and rerun this script."
 fi
 
-if [[ -n "$ACTIVE_LIBSSH_DIR" ]]; then
-  LD_LIBRARY_PATH_VALUE="$ACTIVE_LIBSSH_DIR:$NSYS_HOST_DIR:\${LD_LIBRARY_PATH:-}"
-else
-  LD_LIBRARY_PATH_VALUE="$NSYS_HOST_DIR:\${LD_LIBRARY_PATH:-}"
-fi
+LD_LIBRARY_PATH_PARTS=()
+[[ -n "$ACTIVE_LIBSSH_DIR" ]] && LD_LIBRARY_PATH_PARTS+=("$ACTIVE_LIBSSH_DIR")
+[[ -n "$ACTIVE_LIBBPF_DIR" ]] && LD_LIBRARY_PATH_PARTS+=("$ACTIVE_LIBBPF_DIR")
+LD_LIBRARY_PATH_PARTS+=("$NSYS_HOST_DIR")
+LD_LIBRARY_PATH_VALUE="$(IFS=:; printf '%s' "${LD_LIBRARY_PATH_PARTS[*]}"):\${LD_LIBRARY_PATH:-}"
 
 cat > "$ENV_FILE" <<EOF
 # Source this before running nsys profile on Lambda:

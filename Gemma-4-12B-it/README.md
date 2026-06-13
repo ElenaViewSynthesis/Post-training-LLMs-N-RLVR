@@ -179,7 +179,29 @@ scp /mnt/c/Users/proxi/Documents/ccsyntheticdata/Gemma-4-12B-it/06_mitre_sft.py 
   ubuntu@132.226.76.207:~/Gemma-4-12B-it/06_mitre_sft.py
 ```
 
-**On Lambda, verify tools are available:**
+**Install kernel tracing dependencies:**
+```bash
+sudo apt update
+sudo apt install -y libbpf1
+```
+
+`libbpf1` is used by Linux tools to interact with eBPF/BPF programs in the kernel — required by profiling, tracing, and monitoring tools that rely on eBPF. It lets user-space programs load BPF bytecode into the kernel, create/read BPF maps, and attach probes.
+
+**On Lambda, run the Nsight setup script:**
+```bash
+bash scripts/setup_lambda_nsight.sh
+```
+
+> Only run `source ~/nsys-libs/env.sh` after the script prints:
+> ```
+> [setup-lambda-nsight] Wrote /home/ubuntu/nsys-libs/env.sh
+> ```
+
+```bash
+source ~/nsys-libs/env.sh
+```
+
+**Verify tools are available:**
 ```bash
 which nsys
 which ncu
