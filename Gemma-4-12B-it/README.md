@@ -1,4 +1,4 @@
-# Post-training-LLMs-N-RLVR
+# Gemma 4 12B-IT — MITRE ATT&CK Fine-tuning on Lambda GPU with Profiling
 
 ### Training Runtime Benchmark
 
