@@ -126,6 +126,24 @@ hf auth login
 wandb login
 ```
 
+**WandB training dashboard:**
+[wandb.ai/elenamylocuda-gemma/gemma-4-12b](https://wandb.ai/elenamylocuda-gemma/gemma-4-12b?nw=nwuserelenamylocuda)
+
+**Training metrics (1,185 steps — GH200, ARM64):**
+
+![WandB training metrics](assets/wandb-training-metrics.png)
+
+| Metric | Behaviour |
+|---|---|
+| `train/loss` | Starts ~4.5, drops sharply to ~0.5 by step 400, continues declining to ~0.4 at step 1185 |
+| `train/entropy` | Mirrors loss — falls from ~2.0 to ~0.45, indicating the model becomes more confident |
+| `train/mean_token_accuracy` | Rises from ~0.4 to ~0.85, with a dip around step 150 during the loss spike |
+| `train/grad_norm` | Spikes to ~550 around step 175 (likely a hard batch), then settles near 0 for the rest of the run |
+| `train/learning_rate` | Cosine decay from peak ~0.00016 down to 0 at step 1185 |
+| `train/num_tokens` | Linear growth to ~2.5 M tokens processed by end of run |
+
+The spike in loss, entropy, and grad norm around step 175 is consistent with a single difficult or out-of-distribution batch — the run recovered immediately and continued on a clean downward trajectory.
+
 **4. Run a smoke test:**
 ```bash
 CUDA_VISIBLE_DEVICES=0 python 01_inference.py
