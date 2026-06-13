@@ -12,3 +12,5 @@ requests>=2.32.0
 wandb>=0.27.2
 weave>=0.52.42
 librosa
+fastapi
+uvicorn[standard]

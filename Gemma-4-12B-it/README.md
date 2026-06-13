@@ -180,6 +180,35 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py \
 
 > Default run is QLoRA. Only use `--no-qlora` if you intentionally want full-precision LoRA.
 
+> **Faster future runs:** once `flash-attn` is installed, prefer this as the standard full training command:
+> ```bash
+> accelerate launch 06_mitre_sft.py --attn-implementation flash_attention_2
+> ```
+> Flash Attention 2 reduces memory bandwidth pressure on attention layers, which matters most on long sequences — expect noticeably faster step times on GH200 and A100.
+
+---
+
+### Serving the Fine-tuned Endpoint
+
+**Start the endpoint:**
+```bash
+source ~/nsys-libs/env.sh
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES=0 uvicorn serve_mitre_endpoint:app --host 0.0.0.0 --port 8000
+```
+
+**In a second Lambda SSH terminal, test it:**
+```bash
+curl -s http://127.0.0.1:8000/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "question": "Analyze MITRE ATT&CK technique T1059 Command and Scripting Interpreter. Include attacker behavior, detection ideas, and mitigations.",
+    "max_new_tokens": 700
+  }'
+```
+
+The endpoint loads base `google/gemma-4-12b-it` plus your fine-tuned adapter from `./gemma4-mitre-sft`.
+
 ---
 
 ### Profiling with Nsight Systems and Nsight Compute
