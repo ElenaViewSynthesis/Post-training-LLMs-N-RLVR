@@ -9,6 +9,7 @@ LAMBDA_SSH_LOGIN="${LAMBDA_SSH_LOGIN:-ubuntu@192.222.59.12}"
 LAMBDA_INSTANCE_TYPE="${LAMBDA_INSTANCE_TYPE:-gpu_1x_gh200}"
 NSYS_LIB_ROOT="${NSYS_LIB_ROOT:-$HOME/nsys-libs}"
 NSYS_HOST_DIR="${NSYS_HOST_DIR:-}"
+NSYS_TARGET_DIR="${NSYS_TARGET_DIR:-}"
 REQUIRED_LIBSSH_SYMBOL="${REQUIRED_LIBSSH_SYMBOL:-LIBSSH_4_9_0}"
 DEB_ARCH="$(dpkg --print-architecture)"
 
@@ -47,6 +48,10 @@ log() {
 detect_nsys_host_dir() {
   local candidate
   for candidate in \
+    /usr/lib/aarch64-linux-gnu/nsight-systems/host-linux-sbsa-armv8 \
+    /usr/lib/aarch64-linux-gnu/nsight-systems/host-linux-armv8 \
+    /usr/lib/aarch64-linux-gnu/nsight-systems/host-linux-aarch64 \
+    /usr/lib/x86_64-linux-gnu/nsight-systems/host-linux-x64 \
     /usr/lib/nsight-systems/host-linux-x64 \
     /usr/lib/nsight-systems/host-linux-armv8 \
     /usr/lib/nsight-systems/host-linux-aarch64
@@ -58,9 +63,37 @@ detect_nsys_host_dir() {
   done
 
   local importer
-  importer="$(find /usr/lib/nsight-systems /opt/nvidia/nsight-systems -path '*/QdstrmImporter' -type f -executable -print -quit 2>/dev/null || true)"
+  importer="$(find /usr/lib/aarch64-linux-gnu/nsight-systems /usr/lib/x86_64-linux-gnu/nsight-systems /usr/lib/nsight-systems /opt/nvidia/nsight-systems -path '*/QdstrmImporter' -type f -executable -print -quit 2>/dev/null || true)"
   if [[ -n "$importer" ]]; then
     dirname "$importer"
+    return 0
+  fi
+
+  return 1
+}
+
+detect_nsys_target_dir() {
+  local candidate
+  for candidate in \
+    /usr/lib/aarch64-linux-gnu/nsight-systems/target-linux-sbsa-armv8 \
+    /usr/lib/aarch64-linux-gnu/nsight-systems/target-linux-armv8 \
+    /usr/lib/aarch64-linux-gnu/nsight-systems/target-linux-aarch64 \
+    /usr/lib/x86_64-linux-gnu/nsight-systems/target-linux-x64 \
+    /usr/lib/nsight-systems/target-linux-x64 \
+    /usr/lib/nsight-systems/target-linux-armv8 \
+    /usr/lib/nsight-systems/target-linux-aarch64 \
+    /usr/lib/nsight-systems/target-linux-sbsa-armv8
+  do
+    if [[ -f "$candidate/libToolsInjectionMemoryAllocator.so" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  local injection_lib
+  injection_lib="$(find /usr/lib/aarch64-linux-gnu/nsight-systems /usr/lib/x86_64-linux-gnu/nsight-systems /usr/lib/nsight-systems /opt/nvidia/nsight-systems -name libToolsInjectionMemoryAllocator.so -type f -print -quit 2>/dev/null || true)"
+  if [[ -n "$injection_lib" ]]; then
+    dirname "$injection_lib"
     return 0
   fi
 
@@ -181,6 +214,19 @@ if [[ ! -x "$NSYS_HOST_DIR/QdstrmImporter" ]]; then
   exit 1
 fi
 
+if [[ -z "$NSYS_TARGET_DIR" ]]; then
+  if ! NSYS_TARGET_DIR="$(detect_nsys_target_dir)"; then
+    log "ERROR: Could not find Nsight Systems libToolsInjectionMemoryAllocator.so."
+    log "Check the Nsight install with: find /usr/lib/aarch64-linux-gnu/nsight-systems /usr/lib/x86_64-linux-gnu/nsight-systems /usr/lib/nsight-systems /opt/nvidia/nsight-systems -name libToolsInjectionMemoryAllocator.so"
+    exit 1
+  fi
+fi
+
+if [[ ! -f "$NSYS_TARGET_DIR/libToolsInjectionMemoryAllocator.so" ]]; then
+  log "ERROR: libToolsInjectionMemoryAllocator.so was not found at $NSYS_TARGET_DIR/libToolsInjectionMemoryAllocator.so"
+  exit 1
+fi
+
 SYSTEM_LIBSSH_SO="$(find_system_libssh || true)"
 if [[ -n "$SYSTEM_LIBSSH_SO" ]] && lib_has_symbol "$SYSTEM_LIBSSH_SO"; then
   ACTIVE_LIBSSH_DIR="$(dirname "$SYSTEM_LIBSSH_SO")"
@@ -213,6 +259,7 @@ LD_LIBRARY_PATH_PARTS=()
 [[ -n "$ACTIVE_LIBSSH_DIR" ]] && LD_LIBRARY_PATH_PARTS+=("$ACTIVE_LIBSSH_DIR")
 [[ -n "$ACTIVE_LIBBPF_DIR" ]] && LD_LIBRARY_PATH_PARTS+=("$ACTIVE_LIBBPF_DIR")
 LD_LIBRARY_PATH_PARTS+=("$NSYS_HOST_DIR")
+LD_LIBRARY_PATH_PARTS+=("$NSYS_TARGET_DIR")
 LD_LIBRARY_PATH_VALUE="$(IFS=:; printf '%s' "${LD_LIBRARY_PATH_PARTS[*]}"):\${LD_LIBRARY_PATH:-}"
 
 cat > "$ENV_FILE" <<EOF
@@ -220,6 +267,7 @@ cat > "$ENV_FILE" <<EOF
 #   source "$ENV_FILE"
 export NSYS_LIB_ROOT="$NSYS_LIB_ROOT"
 export NSYS_HOST_DIR="$NSYS_HOST_DIR"
+export NSYS_TARGET_DIR="$NSYS_TARGET_DIR"
 export LAMBDA_SSH_LOGIN="$LAMBDA_SSH_LOGIN"
 export LAMBDA_INSTANCE_TYPE="$LAMBDA_INSTANCE_TYPE"
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_VALUE"

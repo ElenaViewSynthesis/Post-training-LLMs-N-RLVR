@@ -297,3 +297,18 @@ Lambda GPU Cloud
 Connect with `ssh ubuntu@132.226.76.207` if your default SSH identity is registered with Lambda. Otherwise use `ssh -i ~/.ssh/lambda_gpu ubuntu@132.226.76.207` or set `LAMBDA_SSH_KEY_PATH` before running `lambda_gpu.py connect`.
 
 ![Lambda SSH Connection](assets/lambda-ssh-connection.png)
+
+---
+
+### Training Runtime Benchmark
+
+Runtime comparison for fine-tuning `gemma-4-12b-it` on Lambda GPU instances (MITRE ATT&CK SFT, full run).
+
+| GPU Instance | Hardware | VRAM | Runtime | Price | Est. Cost |
+|---|---|---:|---:|---:|---:|
+| GH200 | ARM64 + H100 (Hopper) | 96 GB unified | 57 min | — | ~$2.29 |
+| A100 SXM4 | x86-64 (Ampere) | 40 GB | 1h 37m | $1.99/hr | ~$3.22 |
+
+The GH200 was **40 min faster and ~$1 cheaper** on this workload. The unified 96 GB memory eliminates the VRAM pressure that forces gradient checkpointing and smaller micro-batches on the A100 40 GB, and Hopper-class bf16 throughput is meaningfully higher than Ampere.
+
+**Note:** The GH200 runs Ubuntu on ARM64 (`aarch64`). The Nsight setup script (`scripts/setup_lambda_nsight.sh`) handles the ARM64-specific `libbpf.so.1` and `libssh` symbol issues automatically — see the [Profiling with Nsight Systems](#profiling-with-nsight-systems-and-nsight-compute) section above.
