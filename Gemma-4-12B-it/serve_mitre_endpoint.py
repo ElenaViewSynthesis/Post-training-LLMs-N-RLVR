@@ -179,7 +179,27 @@ INDEX_HTML = """<!doctype html>
 
     <form id="ask-form">
       <label for="question">Question</label>
-      <textarea id="question" name="question">Analyze MITRE ATT&CK technique T1059 Command and Scripting Interpreter. Include attacker behavior, detections, and mitigations.</textarea>
+      <textarea id="question" name="question" placeholder='Return a structured JSON summary for ATT&CK technique Command and Scripting Interpreter (T1059). Include attacker behavior, tactics, platforms, detection ideas, data sources, mitigations, and defender recommendations.
+
+Or this:
+
+Create a defensive security analysis for MITRE ATT&CK T1059 Command and Scripting Interpreter.
+
+Use these sections:
+1. Technique summary
+2. Attacker behavior
+3. Common abuse patterns
+4. Detection logic
+5. Useful telemetry
+6. Mitigations
+7. Example defensive test cases
+
+Also pass more tokens:
+
+{
+  "question": "Create a defensive security analysis for MITRE ATT&CK T1059 Command and Scripting Interpreter. Use sections: technique summary, attacker behavior, common abuse patterns, detection logic, useful telemetry, mitigations, and defensive test cases.",
+  "max_new_tokens": 2000
+}'></textarea>
       <div class="controls">
         <label class="tokens" for="max-tokens">
           Max tokens
