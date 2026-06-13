@@ -227,14 +227,35 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py \
 
 ### Serving the Fine-tuned Endpoint
 
-**Start the endpoint:**
+The FastAPI app is defined in [serve_mitre_endpoint.py](serve_mitre_endpoint.py). It loads the base `google/gemma-4-12b-it` model in 4-bit QLoRA and attaches the fine-tuned PEFT adapter from `./gemma4-mitre-sft`. It exposes three routes:
+
+| Route | Method | Description |
+|---|---|---|
+| `/` | GET | Browser UI — question textarea with prompt guide |
+| `/analyze` | POST | JSON inference endpoint |
+| `/health` | GET | Model load status and CUDA availability |
+
+**1. SSH into Lambda and activate the environment:**
 ```bash
+ssh ubuntu@192.222.59.12
+cd ~/Gemma-4-12B-it
 source ~/nsys-libs/env.sh
 source .venv/bin/activate
+```
+
+**2. Start the endpoint:**
+```bash
 CUDA_VISIBLE_DEVICES=0 uvicorn serve_mitre_endpoint:app --host 0.0.0.0 --port 8000
 ```
 
-**In a second Lambda SSH terminal, test it:**
+The model loads on startup — wait for `Application startup complete` before sending requests.
+
+**3. Check it's up (in a second SSH terminal):**
+```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+**4. Run an analysis via curl:**
 ```bash
 curl -s http://127.0.0.1:8000/analyze \
   -H 'Content-Type: application/json' \
@@ -244,7 +265,30 @@ curl -s http://127.0.0.1:8000/analyze \
   }'
 ```
 
-The endpoint loads base `google/gemma-4-12b-it` plus your fine-tuned adapter from `./gemma4-mitre-sft`.
+**5. For a structured JSON response or detailed sectioned analysis, increase tokens:**
+```bash
+curl -s http://127.0.0.1:8000/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "question": "Create a defensive security analysis for MITRE ATT&CK T1059 Command and Scripting Interpreter. Use sections: technique summary, attacker behavior, common abuse patterns, detection logic, useful telemetry, mitigations, and defensive test cases.",
+    "max_new_tokens": 2000
+  }'
+```
+
+**6. Open the browser UI** (from your local machine via SSH port-forward):
+```bash
+ssh -L 8000:127.0.0.1:8000 ubuntu@192.222.59.12
+```
+Then open `http://localhost:8000` in your browser.
+
+**Run inside tmux for long-lived serving:**
+```bash
+tmux new -s mitre-serve
+source ~/nsys-libs/env.sh
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES=0 uvicorn serve_mitre_endpoint:app --host 0.0.0.0 --port 8000
+# Ctrl-b then d to detach
+```
 
 ---
 
