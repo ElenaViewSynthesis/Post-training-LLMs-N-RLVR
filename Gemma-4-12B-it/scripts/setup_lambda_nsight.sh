@@ -5,20 +5,90 @@ set -euo pipefail
 # Installs nsight-systems through apt, then extracts a newer libssh locally so
 # Nsight's QDSTRM importer can satisfy LIBSSH_4_9_0 without replacing system libs.
 
+LAMBDA_SSH_LOGIN="${LAMBDA_SSH_LOGIN:-ubuntu@192.222.59.12}"
+LAMBDA_INSTANCE_TYPE="${LAMBDA_INSTANCE_TYPE:-gpu_1x_gh200}"
 NSYS_LIB_ROOT="${NSYS_LIB_ROOT:-$HOME/nsys-libs}"
-NSYS_HOST_DIR="${NSYS_HOST_DIR:-/usr/lib/nsight-systems/host-linux-x64}"
-LIBSSH_DEB_URL="${LIBSSH_DEB_URL:-https://archive.ubuntu.com/ubuntu/pool/main/libs/libssh/libssh-4_0.10.6-2build2_amd64.deb}"
+NSYS_HOST_DIR="${NSYS_HOST_DIR:-}"
+REQUIRED_LIBSSH_SYMBOL="${REQUIRED_LIBSSH_SYMBOL:-LIBSSH_4_9_0}"
+DEB_ARCH="$(dpkg --print-architecture)"
+
+case "$DEB_ARCH" in
+  amd64)
+    DEFAULT_LIBSSH_DEB_URL="https://archive.ubuntu.com/ubuntu/pool/main/libs/libssh/libssh-4_0.10.6-2build2_amd64.deb"
+    LIBSSH_MULTIARCH="x86_64-linux-gnu"
+    ;;
+  arm64)
+    DEFAULT_LIBSSH_DEB_URL="https://ports.ubuntu.com/ubuntu-ports/pool/main/libs/libssh/libssh-4_0.10.6-2build2_arm64.deb"
+    LIBSSH_MULTIARCH="aarch64-linux-gnu"
+    ;;
+  *)
+    echo "[setup-lambda-nsight] ERROR: Unsupported Ubuntu architecture: $DEB_ARCH" >&2
+    exit 1
+    ;;
+esac
+
+LIBSSH_DEB_URL="${LIBSSH_DEB_URL:-$DEFAULT_LIBSSH_DEB_URL}"
 LIBSSH_DEB_NAME="${LIBSSH_DEB_URL##*/}"
-LIBSSH_DIR="$NSYS_LIB_ROOT/usr/lib/x86_64-linux-gnu"
-LIBSSH_SO="$LIBSSH_DIR/libssh.so.4"
+LOCAL_LIBSSH_DIR="$NSYS_LIB_ROOT/usr/lib/$LIBSSH_MULTIARCH"
+LOCAL_LIBSSH_SO="$LOCAL_LIBSSH_DIR/libssh.so.4"
+ACTIVE_LIBSSH_DIR=""
 ENV_FILE="$NSYS_LIB_ROOT/env.sh"
 
-log() {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+log() {
   printf '[setup-lambda-nsight] %s\n' "$*"
 }
 
+detect_nsys_host_dir() {
+  local candidate
+  for candidate in \
+    /usr/lib/nsight-systems/host-linux-x64 \
+    /usr/lib/nsight-systems/host-linux-armv8 \
+    /usr/lib/nsight-systems/host-linux-aarch64
+  do
+    if [[ -x "$candidate/QdstrmImporter" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  local importer
+  importer="$(find /usr/lib/nsight-systems /opt/nvidia/nsight-systems -path '*/QdstrmImporter' -type f -executable -print -quit 2>/dev/null || true)"
+  if [[ -n "$importer" ]]; then
+    dirname "$importer"
+    return 0
+  fi
+
+  return 1
+}
+
+find_system_libssh() {
+  local libssh_so
+  libssh_so="$(ldconfig -p 2>/dev/null | awk '/libssh\.so\.4 / { print $NF; exit }')"
+  if [[ -n "$libssh_so" && -f "$libssh_so" ]]; then
+    printf '%s\n' "$libssh_so"
+    return 0
+  fi
+
+  for libssh_so in \
+    "/usr/lib/$LIBSSH_MULTIARCH/libssh.so.4" \
+    /usr/lib/libssh.so.4
+  do
+    if [[ -f "$libssh_so" ]]; then
+      printf '%s\n' "$libssh_so"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+lib_has_symbol() {
+  local libssh_so="$1"
+  [[ -f "$libssh_so" ]] && strings "$libssh_so" | grep -q "$REQUIRED_LIBSSH_SYMBOL"
+}
+
 download() {
-  local url="$1"                                          
+  local url="$1"
   local output="$2"
 
   if command -v wget >/dev/null 2>&1; then
@@ -33,9 +103,20 @@ download() {
   fi
 }
 
+log "Lambda login: $LAMBDA_SSH_LOGIN"
+log "Lambda instance type: $LAMBDA_INSTANCE_TYPE"
+log "Detected Ubuntu architecture: $DEB_ARCH"
 log "Installing Nsight Systems if needed."
 sudo apt-get update
-sudo apt-get install -y nsight-systems
+sudo apt-get install -y nsight-systems binutils libssh-4
+
+if [[ -z "$NSYS_HOST_DIR" ]]; then
+  if ! NSYS_HOST_DIR="$(detect_nsys_host_dir)"; then
+    log "ERROR: Could not find Nsight Systems QdstrmImporter."
+    log "Check the Nsight install with: dpkg -L nsight-systems | grep QdstrmImporter"
+    exit 1
+  fi
+fi
 
 if [[ ! -x "$NSYS_HOST_DIR/QdstrmImporter" ]]; then
   log "ERROR: QdstrmImporter was not found at $NSYS_HOST_DIR/QdstrmImporter"
@@ -43,7 +124,11 @@ if [[ ! -x "$NSYS_HOST_DIR/QdstrmImporter" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$LIBSSH_SO" ]] || ! strings "$LIBSSH_SO" | grep -q 'LIBSSH_4_9_0'; then
+SYSTEM_LIBSSH_SO="$(find_system_libssh || true)"
+if [[ -n "$SYSTEM_LIBSSH_SO" ]] && lib_has_symbol "$SYSTEM_LIBSSH_SO"; then
+  ACTIVE_LIBSSH_DIR="$(dirname "$SYSTEM_LIBSSH_SO")"
+  log "System libssh provides $REQUIRED_LIBSSH_SYMBOL: $SYSTEM_LIBSSH_SO"
+elif ! lib_has_symbol "$LOCAL_LIBSSH_SO"; then
   log "Installing newer libssh locally under $NSYS_LIB_ROOT."
   mkdir -p "$NSYS_LIB_ROOT"
 
@@ -53,13 +138,24 @@ if [[ ! -f "$LIBSSH_SO" ]] || ! strings "$LIBSSH_SO" | grep -q 'LIBSSH_4_9_0'; t
   download "$LIBSSH_DEB_URL" "$tmpdir/$LIBSSH_DEB_NAME"
   dpkg-deb -x "$tmpdir/$LIBSSH_DEB_NAME" "$NSYS_LIB_ROOT"
 else
-  log "Local libssh already has LIBSSH_4_9_0."
+  log "Local libssh already has $REQUIRED_LIBSSH_SYMBOL."
 fi
 
-if ! strings "$LIBSSH_SO" | grep -q 'LIBSSH_4_9_0'; then
-  log "ERROR: $LIBSSH_SO does not provide LIBSSH_4_9_0."
-  log "Set LIBSSH_DEB_URL to a newer libssh-4 .deb and rerun this script."
-  exit 1
+if [[ -z "$ACTIVE_LIBSSH_DIR" ]] && lib_has_symbol "$LOCAL_LIBSSH_SO"; then
+  ACTIVE_LIBSSH_DIR="$LOCAL_LIBSSH_DIR"
+  log "Local libssh provides $REQUIRED_LIBSSH_SYMBOL: $LOCAL_LIBSSH_SO"
+fi
+
+if [[ -z "$ACTIVE_LIBSSH_DIR" ]]; then
+  log "WARNING: No libssh.so.4 with $REQUIRED_LIBSSH_SYMBOL was found."
+  log "Continuing without a local libssh override. If nsys reports a libssh symbol error,"
+  log "set LIBSSH_DEB_URL to a newer libssh-4 .deb for $DEB_ARCH and rerun this script."
+fi
+
+if [[ -n "$ACTIVE_LIBSSH_DIR" ]]; then
+  LD_LIBRARY_PATH_VALUE="$ACTIVE_LIBSSH_DIR:$NSYS_HOST_DIR:\${LD_LIBRARY_PATH:-}"
+else
+  LD_LIBRARY_PATH_VALUE="$NSYS_HOST_DIR:\${LD_LIBRARY_PATH:-}"
 fi
 
 cat > "$ENV_FILE" <<EOF
@@ -67,7 +163,9 @@ cat > "$ENV_FILE" <<EOF
 #   source "$ENV_FILE"
 export NSYS_LIB_ROOT="$NSYS_LIB_ROOT"
 export NSYS_HOST_DIR="$NSYS_HOST_DIR"
-export LD_LIBRARY_PATH="$LIBSSH_DIR:$NSYS_HOST_DIR:\${LD_LIBRARY_PATH:-}"
+export LAMBDA_SSH_LOGIN="$LAMBDA_SSH_LOGIN"
+export LAMBDA_INSTANCE_TYPE="$LAMBDA_INSTANCE_TYPE"
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH_VALUE"
 EOF
 
 log "Wrote $ENV_FILE"
