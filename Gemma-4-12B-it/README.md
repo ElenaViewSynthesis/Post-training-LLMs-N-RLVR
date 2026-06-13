@@ -2,7 +2,7 @@
 
 ### Training Runtime Benchmark
 
-Runtime comparison for fine-tuning `gemma-4-12b-it` on Lambda GPU instances (MITRE ATT&CK SFT, full run).
+Runtime comparison for fine-tuning `gemma-4-12b-it` on Lambda GPU instances (MITRE ATT&CK SFT, full run — **1,185 training steps**).
 
 | GPU Instance | Hardware | VRAM | Runtime | Price | Est. Cost |
 |---|---|---:|---:|---:|---:|
@@ -122,7 +122,7 @@ pip install -r requirements.txt
 
 **3. Authenticate:**
 ```bash
-huggingface-cli login
+hf auth login
 wandb login
 ```
 
@@ -183,6 +183,34 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 06_mitre_sft.py \
 ---
 
 ### Profiling with Nsight Systems and Nsight Compute
+
+**Profiling method used for the MITRE ATT&CK fine-tuning run:**
+
+```
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --sample=none \
+  --cpuctxsw=none \
+  ...
+```
+
+Full name: **Nsight Systems CUDA/NVTX/OS runtime timeline profiling.**
+
+**What it captures:**
+
+| Flag | Captures |
+|---|---|
+| `cuda` | CUDA kernel launches, GPU work, CUDA API calls, memory copies |
+| `nvtx` | Custom training-step ranges from `06_mitre_sft.py --nvtx` |
+| `osrt` | OS runtime calls — waits, synchronization, file I/O, process behavior |
+
+**What it does not capture:**
+
+- Per-kernel low-level metrics — that requires Nsight Compute (`ncu`)
+- CPU statistical samples — disabled with `--sample=none`
+- CPU context-switch tracing — disabled with `--cpuctxsw=none`
+
+---
 
 **What changed in the codebase:**
 - `06_mitre_sft.py` — `--nvtx` flag adds NVTX ranges around training steps; `--max-steps` limits the run to a short profiling window
