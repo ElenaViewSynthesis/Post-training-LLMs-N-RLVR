@@ -17,6 +17,25 @@ The GH200 was **40 min faster and ~$1 cheaper** on this workload. The unified 96
 
 ## Gemma 4 12B-IT — Lambda Cloud GPU Guide
 
+### GH200 GPU Utilisation During Training
+
+![WandB GPU metrics — GH200 MITRE SFT run](assets/wandb-gpu-metrics.png)
+
+WandB system metrics captured during the full 1,185-step MITRE ATT&CK SFT run on a Lambda `gpu_1x_gh200` (ARM64, 96 GB unified memory):
+
+| Metric | Observed behaviour |
+|---|---|
+| **GPU Utilisation (%)** | Highly variable — oscillates between 20–100%, averaging ~60%. Typical for QLoRA fine-tuning where compute bursts are interleaved with data loading and gradient steps. |
+| **GPU Memory Allocated (Bytes)** | Steps up in stages during model + optimizer load (~2×10¹⁰ → ~7×10¹⁰ bytes), then holds flat for the rest of the run — confirming no memory leak. |
+| **GPU Memory Allocated (%)** | Stabilises at ~75–95% after the first 15 minutes, making good use of the 96 GB unified pool without OOM risk. |
+| **GPU DRAM Active (%)** | Stays in the 10–40% range throughout — DRAM bandwidth is not the bottleneck on this workload. |
+| **GPU PCIe Rx Bytes** | Steady ~0.3 GB/s inbound — consistent with continuous batch transfers from host to device. |
+| **GPU PCIe Tx Bytes** | Sparse spikes up to ~0.05 GB/s — gradient or checkpoint writes back to host, infrequent as expected. |
+
+The flat memory profile and consistent PCIe Rx throughput confirm the GH200's unified memory architecture is well-suited to this workload — no swapping, no OOM, and the large pool eliminates the gradient checkpointing overhead that squeezes A100 40 GB runs.
+
+---
+
 ### Memory Footprint
 
 | Component | VRAM |
