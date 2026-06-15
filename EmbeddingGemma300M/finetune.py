@@ -11,12 +11,13 @@ Models supported:
 
 import os
 from dataclasses import dataclass, field
+
+import torch
 from dotenv import load_dotenv
 
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-import torch
 from datasets import load_dataset, Dataset
 from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
@@ -274,8 +275,8 @@ if __name__ == "__main__":
 
     if cfg.hub_repo:
         print(f"Pushing adapters to {cfg.hub_repo} ...")
-        model.push_to_hub(cfg.hub_repo, token=HF_TOKEN)
-        model.push_to_hub_merged(f"{cfg.hub_repo}-merged", token=HF_TOKEN)
+        model.push_to_hub(cfg.hub_repo)
+        model.push_to_hub_merged(f"{cfg.hub_repo}-merged")
 
     # ── 11. vLLM inference on the merged model ────────────────────────────────────
 
@@ -289,14 +290,24 @@ if __name__ == "__main__":
         max_model_len=cfg.max_seq_length,
     )
 
+    # Hardcoded financial domain examples
     test_queries = [
-        "What is the capital of France?",
-        "How does photosynthesis work?",
+        "What was Microsoft's revenue growth in Q3 2024?",
+        "How did Apple perform in terms of iPhone sales last quarter?",
+        "What are NVIDIA's data center revenue trends?",
+        "How is JPMorgan managing credit risk in the current environment?",
     ]
     test_documents = [
-        "Paris is the capital and largest city of France.",
-        "Photosynthesis is the process by which plants convert sunlight into energy.",
+        "Microsoft reported strong Q3 2024 results with revenue growing 17% year-over-year, driven by Azure cloud services and AI product adoption.",
+        "Apple's iPhone sales declined slightly last quarter amid weak demand in China, though services revenue hit a record high.",
+        "NVIDIA's data center segment surged over 400% year-over-year, fueled by explosive demand for H100 GPUs used in AI training workloads.",
+        "JPMorgan Chase increased its loan loss reserves amid rising charge-offs and uncertainty around consumer credit quality in a higher-rate environment.",
     ]
+
+    # Append live examples from the evaluation set
+    sample_rows = eval_dataset.select(range(4))
+    test_queries   = test_queries   + list(sample_rows["anchor"])
+    test_documents = test_documents + list(sample_rows["positive"])
 
     query_outputs    = llm.embed(test_queries)
     document_outputs = llm.embed(test_documents)
@@ -304,8 +315,23 @@ if __name__ == "__main__":
     query_vecs = torch.tensor([o.outputs.embedding for o in query_outputs])
     doc_vecs   = torch.tensor([o.outputs.embedding for o in document_outputs])
 
+    # Pair-wise scores: each query is matched only against its corresponding document (diagonal).
+    # Useful for sanity-checking that the model assigns high similarity to correct pairs.
     similarity = torch.nn.functional.cosine_similarity(query_vecs, doc_vecs)
+    print("\n── Pair-wise cosine similarity (query[i] ↔ document[i]) ──")
     for q, d, s in zip(test_queries, test_documents, similarity):
         print(f"\nQuery:    {q}")
         print(f"Document: {d}")
         print(f"Score:    {s:.4f}")
+
+    # Full similarity matrix: every query scored against every document.
+    # Ranking shows which document the model retrieves first for query[0].
+    sim_matrix = query_vecs @ doc_vecs.T   # (n_queries, n_docs)
+    ranking = sim_matrix.argsort(descending=True)[0]
+
+    print("\n── Ranked retrieval — query[0] vs all documents (descending score) ──")
+    for idx in ranking.tolist():
+        print(
+            f"{sim_matrix[0][idx]:.4f} | "
+            f"{test_documents[idx][:100]}"
+        )

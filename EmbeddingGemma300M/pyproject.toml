@@ -4,6 +4,8 @@ version = "0.1.0"
 requires-python = ">=3.10"
 
 dependencies = [
+    "torch",
+    "torchao>=0.16.0",
     "transformers==4.56.2",
     "sentencepiece",
     "protobuf",
@@ -17,6 +19,9 @@ dependencies = [
     "triton",
     "unsloth",
     "unsloth_zoo",
+    "vllm",
+    "sentence-transformers",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
