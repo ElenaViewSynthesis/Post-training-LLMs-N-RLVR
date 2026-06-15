@@ -31,7 +31,8 @@ uv pip install \
   "huggingface_hub>=0.34.0" \
   hf_transfer \
   "transformers==4.56.2" \
-  sentence-transformers
+  sentence-transformers \
+  python-dotenv
 
 # ── 6. No-deps installs (avoid resolver conflicts) ────────────────────────────
 uv pip install --no-deps \

@@ -11,6 +11,10 @@ Models supported:
 
 import os
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 import torch
 from datasets import load_dataset, Dataset
@@ -213,16 +217,53 @@ if __name__ == "__main__":
     print("Starting training ...")
     trainer_stats = trainer.train()
 
-    # ── Memory stats after training ──────────────────────────────────────────────
-    used_memory       = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
-    used_memory_lora  = round(used_memory - start_gpu_memory, 3)
-    print(f"Peak memory during training: {used_memory} GB.")
-    print(f"Memory used for LoRA training: {used_memory_lora} GB.")
+    # ── Final memory and time stats ───────────────────────────────────────────────
+    used_memory            = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    used_memory_for_lora   = round(used_memory - start_gpu_memory, 3)
+    used_percentage        = round(used_memory / max_memory * 100, 3)
+    lora_percentage        = round(used_memory_for_lora / max_memory * 100, 3)
+    print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
+    print(f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} minutes used for training.")
+    print(f"Peak reserved memory = {used_memory} GB.")
+    print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
+    print(f"Peak reserved memory % of max memory = {used_percentage} %.")
+    print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
 
-    # ── 8. Save LoRA adapters ─────────────────────────────────────────────────────
+    # ── Post-training evaluation ──────────────────────────────────────────────────
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_dtype != torch.float16):
+        print("Post-training evaluator score:", evaluator(model))
+
+    # ── Post-training inference example ──────────────────────────────────────────
+    # Replace query and candidates with examples from your domain.
+    query = "Patient presents with sharp chest pain that improves when leaning forward."
+
+    candidates = [
+        "Acute Pericarditis often involves pleuritic chest pain relieved by sitting up and leaning forward.",
+        "Myocardial Infarction typically presents with crushing substernal pressure and radiation to the left arm.",
+        "Pneumothorax is characterized by sudden onset shortness of breath and unilateral chest pain.",
+        "Gastroesophageal Reflux Disease (GERD) causes burning retrosternal pain usually after meals.",
+    ]
+
+    query_emb      = model.encode(query, convert_to_tensor=True)
+    candidate_embs = model.encode(candidates, convert_to_tensor=True)
+    similarities   = model.similarity(query_emb, candidate_embs)
+
+    ranking = similarities.argsort(descending=True)[0]
+
+    print(f"\nQuery: {query}\n")
+    for idx in ranking.tolist():
+        score = similarities[0][idx].item()
+        print(f"{score:.4f} | {candidates[idx]}")
+
+    # ── 8. Save LoRA adapters only (16-bit) ──────────────────────────────────────
+    # Saves adapter weights + tokenizer. Does NOT include base model weights.
+    # Reload with: FastSentenceTransformer.from_pretrained(path, for_inference=True)
 
     print(f"Saving LoRA adapters to {cfg.output_adapters} ...")
     model.save_pretrained(cfg.output_adapters)
+    model.tokenizer.save_pretrained(cfg.output_adapters)
+    model.push_to_hub("borntobeignored/embeddinggemma_lora", token=HF_TOKEN)
+    model.tokenizer.push_to_hub("borntobeignored/embeddinggemma_lora", token=HF_TOKEN)
 
     # ── 9. Merge adapters into base model and save ────────────────────────────────
 
@@ -233,8 +274,8 @@ if __name__ == "__main__":
 
     if cfg.hub_repo:
         print(f"Pushing adapters to {cfg.hub_repo} ...")
-        model.push_to_hub(cfg.hub_repo)
-        model.push_to_hub_merged(f"{cfg.hub_repo}-merged")
+        model.push_to_hub(cfg.hub_repo, token=HF_TOKEN)
+        model.push_to_hub_merged(f"{cfg.hub_repo}-merged", token=HF_TOKEN)
 
     # ── 11. vLLM inference on the merged model ────────────────────────────────────
 
