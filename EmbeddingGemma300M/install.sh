@@ -30,7 +30,8 @@ uv pip install \
   "datasets==4.3.0" \
   "huggingface_hub>=0.34.0" \
   hf_transfer \
-  "transformers==4.56.2"
+  "transformers==4.56.2" \
+  sentence-transformers
 
 # ── 6. No-deps installs (avoid resolver conflicts) ────────────────────────────
 uv pip install --no-deps \
@@ -45,5 +46,8 @@ uv pip install --no-deps \
 
 # ── 7. torchao — upgrade-only, no-deps ────────────────────────────────────────
 uv pip install --no-deps --upgrade "torchao>=0.16.0"
+
+# ── 8. vLLM ───────────────────────────────────────────────────────────────────
+uv pip install vllm
 
 echo "✓ Environment ready"

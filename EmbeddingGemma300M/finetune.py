@@ -3,10 +3,10 @@ Full fine-tuning pipeline for embedding models using Unsloth + LoRA,
 followed by vLLM serving of the merged model.
 
 Models supported:
-  google/embeddinggemma-300m
-  Qwen/Qwen3-Embedding-0.6B
-  sentence-transformers/all-MiniLM-L6-v2
-  BAAI/bge-reranker-v2-m3
+  unsloth/embeddinggemma-300m
+  unsloth/Qwen3-Embedding-0.6B
+  unsloth/all-MiniLM-L6-v2
+  unsloth/bge-reranker-v2-m3
 """
 
 import os
@@ -22,41 +22,58 @@ from unsloth import FastSentenceTransformer
 # Long documents: use the model's full context window.
 # Reduce if you hit OOM — memory scales quadratically with sequence length.
 MAX_SEQ_LENGTHS = {
-    "google/embeddinggemma-300m":            8192,
-    "Qwen/Qwen3-Embedding-0.6B":            32768,
-    "sentence-transformers/all-MiniLM-L6-v2":  512,  # hard BERT cap
-    "BAAI/bge-reranker-v2-m3":              8192,
+    "unsloth/embeddinggemma-300m":  8192,
+    "unsloth/Qwen3-Embedding-0.6B": 32768,
+    "unsloth/all-MiniLM-L6-v2":    512,    # hard BERT cap
+    "unsloth/bge-reranker-v2-m3":  8192,
 }
 
 # Batch size drops with longer sequences to keep VRAM stable.
 # Rule of thumb: halve the batch size each time you double the seq length.
 BATCH_SIZES = {
-    "google/embeddinggemma-300m":             4,
-    "Qwen/Qwen3-Embedding-0.6B":              2,
-    "sentence-transformers/all-MiniLM-L6-v2": 32,
-    "BAAI/bge-reranker-v2-m3":                4,
+    "unsloth/embeddinggemma-300m":  4,
+    "unsloth/Qwen3-Embedding-0.6B": 2,
+    "unsloth/all-MiniLM-L6-v2":    32,
+    "unsloth/bge-reranker-v2-m3":  4,
+}
+
+# LoRA target modules differ by architecture:
+#   decoder (Gemma, Qwen)   → attention + MLP projection layers
+#   encoder (BERT, RoBERTa) → attention only, different naming
+TARGET_MODULES = {
+    "unsloth/embeddinggemma-300m":  ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+    "unsloth/Qwen3-Embedding-0.6B": ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+    "unsloth/all-MiniLM-L6-v2":    ("query",  "key",    "value"),
+    "unsloth/bge-reranker-v2-m3":  ("query",  "key",    "value",  "dense"),
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Config:
-    model_id: str        = "google/embeddinggemma-300m"
+    model_id: str        = "unsloth/embeddinggemma-300m"
     dataset_id: str      = "sentence-transformers/natural-questions-hard-negatives"
     output_adapters: str = "output/lora-adapters"
     output_merged: str   = "output/merged-model"
     hub_repo: str        = ""           # set to push: "your-hf-username/embeddinggemma-finetuned"
 
-    lora_r: int          = 16
-    lora_alpha: int      = 32
-    lora_dropout: float  = 0.05
-    target_modules: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
+    lora_r: int               = 16        # 8, 16, 32, 64, 128
+    lora_alpha: int           = 32        # 64
+    lora_dropout: float       = 0.05
+    use_rslora: bool          = False     # rank stabilized LoRA
+    loftq_config              = None      # LoftQ quantization config
+    task_type: str            = "FEATURE_EXTRACTION"
+    use_gradient_checkpointing = "unsloth" # True or "unsloth" for very long context
+    random_state: int         = 3407
+
+    @property
+    def target_modules(self) -> tuple:
+        return TARGET_MODULES.get(self.model_id, ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"))
 
     num_train_epochs: int        = 1
     gradient_accumulation_steps: int = 8   # effective batch = per_device_batch_size × 8
     learning_rate: float         = 2e-4
     warmup_ratio: float          = 0.1
-    gradient_checkpointing: bool = True    # trades compute for VRAM; essential for long seqs
     fp16: bool                   = not torch.cuda.is_bf16_supported()
     bf16: bool                   = torch.cuda.is_bf16_supported()
 
@@ -76,6 +93,7 @@ print(f"Loading {cfg.model_id} ...")
 model = FastSentenceTransformer.from_pretrained(
     cfg.model_id,
     max_seq_length=cfg.max_seq_length,
+    full_finetuning = False, #
 )
 
 model = FastSentenceTransformer.get_peft_model(
