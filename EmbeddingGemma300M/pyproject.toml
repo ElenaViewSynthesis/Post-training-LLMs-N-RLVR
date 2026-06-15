@@ -1,0 +1,39 @@
+[project]
+name = "your-project"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+dependencies = [
+    "transformers==4.56.2",
+    "sentencepiece",
+    "protobuf",
+    "datasets==4.3.0",
+    "huggingface_hub>=0.34.0",
+    "hf_transfer",
+    "bitsandbytes",
+    "accelerate",
+    "peft",
+    "trl==0.22.2",
+    "triton",
+    "unsloth",
+    "unsloth_zoo",
+]
+
+[project.optional-dependencies]
+# Pin xformers per torch version at install time (see install script)
+cu124 = ["xformers==0.0.34"]   # torch 2.10
+cu121 = ["xformers==0.0.33.post1"]  # torch 2.9
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
