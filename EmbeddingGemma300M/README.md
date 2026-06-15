@@ -129,6 +129,32 @@ model.push_to_hub("your-hf-username/model-name")    # upload to Hub
 > model = FastSentenceTransformer.from_pretrained("...", for_inference=True)
 > ```
 
+### LoftQ Quantization
+
+LoftQ initializes LoRA adapters to approximate the quantization error of the base model weights, giving training a better starting point than random initialization:
+
+```
+W_original ≈ Q(W) + BA
+```
+
+where `Q(W)` is the 4-bit quantized weight and `BA` is the LoRA correction. Enable it by passing a `LoftQConfig` to `get_peft_model`:
+
+```python
+from peft import LoftQConfig
+
+loftq_config = LoftQConfig(loftq_bits=4, loftq_iter=1)
+```
+
+**When to use it:**
+
+| Situation | Use LoftQ? |
+|---|---|
+| Standard fine-tuning, stable loss | No (default `None`) |
+| 4-bit QLoRA, loss spikes early | Yes |
+| Very long context or small model | Yes — quantization error compounds at long sequence lengths |
+
+For `embeddinggemma-300m` at 4-bit QLoRA it is worth enabling if you see unstable loss at the start of training.
+
 ## References
 
 - \[1\] [Unsloth Embedding Fine-tuning Docs](https://unsloth.ai/docs/basics/embedding-finetuning)

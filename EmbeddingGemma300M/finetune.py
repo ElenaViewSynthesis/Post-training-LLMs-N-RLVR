@@ -107,6 +107,13 @@ model = FastSentenceTransformer.get_peft_model(
 )
 model.print_trainable_parameters()
 
+# ── Memory stats after model + LoRA setup ────────────────────────────────────
+gpu_stats         = torch.cuda.get_device_properties(0)
+start_gpu_memory  = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+max_memory        = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
+print(f"{start_gpu_memory} GB of memory reserved.")
+
 # ── 2. Dataset ────────────────────────────────────────────────────────────────
 
 print(f"Loading dataset {cfg.dataset_id} ...")
@@ -165,88 +172,99 @@ autocast_dtype = torch.bfloat16 if cfg.bf16 else torch.float16
 with torch.autocast(device_type="cuda", dtype=autocast_dtype):
     print("Baseline evaluator score:", evaluator(model))
 
-# ── 5. Loss function ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # ── 5. Loss function ──────────────────────────────────────────────────────────
 
-loss = TripletLoss(model)
-# loss = MultipleNegativesRankingLoss(model)  # alternative: in-batch negatives, no explicit negative column needed
+    loss = TripletLoss(model)
+    # loss = MultipleNegativesRankingLoss(model)  # alternative: in-batch negatives, no explicit negative column needed
 
-# ── 6. Training arguments ─────────────────────────────────────────────────────
+    # ── 6. Training arguments ─────────────────────────────────────────────────────
 
-args = SentenceTransformerTrainingArguments(
-    output_dir=cfg.output_adapters,
-    num_train_epochs=cfg.num_train_epochs,
-    per_device_train_batch_size=cfg.per_device_batch_size,
-    gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-    learning_rate=cfg.learning_rate,
-    warmup_ratio=cfg.warmup_ratio,
-    fp16=cfg.fp16,
-    bf16=cfg.bf16,
-    gradient_checkpointing=cfg.use_gradient_checkpointing,
-    save_strategy="epoch",
-    logging_steps=50,
-    report_to="none",
-)
+    args = SentenceTransformerTrainingArguments(
+        output_dir=cfg.output_adapters,
+        num_train_epochs=cfg.num_train_epochs,
+        per_device_train_batch_size=cfg.per_device_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        learning_rate=cfg.learning_rate,
+        warmup_ratio=cfg.warmup_ratio,
+        fp16=cfg.fp16,
+        bf16=cfg.bf16,
+        gradient_checkpointing=cfg.use_gradient_checkpointing,
+        save_strategy="epoch",
+        logging_steps=50,
+        report_to="none",
+    )
 
-# ── 7. Train ──────────────────────────────────────────────────────────────────
+    # ── 7. Train ──────────────────────────────────────────────────────────────────
 
-trainer = SentenceTransformerTrainer(
-    model=model,
-    args=args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    loss=loss,
-    evaluator=evaluator,
-)
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        loss=loss,
+        evaluator=evaluator,
+    )
 
-print("Starting training ...")
-trainer.train()
+    # ── Memory stats before training ─────────────────────────────────────────────
+    pre_train_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    print(f"Memory reserved before training: {pre_train_memory} GB / {max_memory} GB.")
 
-# ── 6. Save LoRA adapters ─────────────────────────────────────────────────────
+    print("Starting training ...")
+    trainer_stats = trainer.train()
 
-print(f"Saving LoRA adapters to {cfg.output_adapters} ...")
-model.save_pretrained(cfg.output_adapters)
+    # ── Memory stats after training ──────────────────────────────────────────────
+    used_memory       = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    used_memory_lora  = round(used_memory - start_gpu_memory, 3)
+    print(f"Peak memory during training: {used_memory} GB.")
+    print(f"Memory used for LoRA training: {used_memory_lora} GB.")
 
-# ── 7. Merge adapters into base model and save ────────────────────────────────
+    # ── 8. Save LoRA adapters ─────────────────────────────────────────────────────
 
-print(f"Merging and saving to {cfg.output_merged} ...")
-model.save_pretrained_merged(cfg.output_merged)
+    print(f"Saving LoRA adapters to {cfg.output_adapters} ...")
+    model.save_pretrained(cfg.output_adapters)
 
-# ── 8. (Optional) Push to Hugging Face Hub ───────────────────────────────────
+    # ── 9. Merge adapters into base model and save ────────────────────────────────
 
-if cfg.hub_repo:
-    print(f"Pushing adapters to {cfg.hub_repo} ...")
-    model.push_to_hub(cfg.hub_repo)
-    model.push_to_hub_merged(f"{cfg.hub_repo}-merged")
+    print(f"Merging and saving to {cfg.output_merged} ...")
+    model.save_pretrained_merged(cfg.output_merged)
 
-# ── 9. vLLM inference on the merged model ────────────────────────────────────
+    # ── 10. (Optional) Push to Hugging Face Hub ──────────────────────────────────
 
-print("Loading merged model into vLLM ...")
-from vllm import LLM
+    if cfg.hub_repo:
+        print(f"Pushing adapters to {cfg.hub_repo} ...")
+        model.push_to_hub(cfg.hub_repo)
+        model.push_to_hub_merged(f"{cfg.hub_repo}-merged")
 
-llm = LLM(
-    model=cfg.output_merged,
-    task="embed",
-    dtype="bfloat16" if cfg.bf16 else "float16",
-    max_model_len=cfg.max_seq_length,
-)
+    # ── 11. vLLM inference on the merged model ────────────────────────────────────
 
-queries = [
-    "What is the capital of France?",
-    "How does photosynthesis work?",
-]
-documents = [
-    "Paris is the capital and largest city of France.",
-    "Photosynthesis is the process by which plants convert sunlight into energy.",
-]
+    print("Loading merged model into vLLM ...")
+    from vllm import LLM
 
-query_outputs    = llm.embed(queries)
-document_outputs = llm.embed(documents)
+    llm = LLM(
+        model=cfg.output_merged,
+        task="embed",
+        dtype="bfloat16" if cfg.bf16 else "float16",
+        max_model_len=cfg.max_seq_length,
+    )
 
-query_vecs = torch.tensor([o.outputs.embedding for o in query_outputs])
-doc_vecs   = torch.tensor([o.outputs.embedding for o in document_outputs])
+    test_queries = [
+        "What is the capital of France?",
+        "How does photosynthesis work?",
+    ]
+    test_documents = [
+        "Paris is the capital and largest city of France.",
+        "Photosynthesis is the process by which plants convert sunlight into energy.",
+    ]
 
-similarity = torch.nn.functional.cosine_similarity(query_vecs, doc_vecs)
-for q, d, s in zip(queries, documents, similarity):
-    print(f"\nQuery:    {q}")
-    print(f"Document: {d}")
-    print(f"Score:    {s:.4f}")
+    query_outputs    = llm.embed(test_queries)
+    document_outputs = llm.embed(test_documents)
+
+    query_vecs = torch.tensor([o.outputs.embedding for o in query_outputs])
+    doc_vecs   = torch.tensor([o.outputs.embedding for o in document_outputs])
+
+    similarity = torch.nn.functional.cosine_similarity(query_vecs, doc_vecs)
+    for q, d, s in zip(test_queries, test_documents, similarity):
+        print(f"\nQuery:    {q}")
+        print(f"Document: {d}")
+        print(f"Score:    {s:.4f}")
