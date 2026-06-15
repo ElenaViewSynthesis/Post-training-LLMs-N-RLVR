@@ -16,7 +16,7 @@ import torch
 from datasets import load_dataset, Dataset
 from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from sentence_transformers.losses import MultipleNegativesRankingLoss
+from sentence_transformers.losses import TripletLoss, MultipleNegativesRankingLoss
 from unsloth import FastSentenceTransformer
 
 # ── Per-model sequence length limits ─────────────────────────────────────────
@@ -121,13 +121,31 @@ stream_eval = list(
 train_dataset = Dataset.from_generator(lambda: (yield from stream_train))
 eval_dataset  = Dataset.from_generator(lambda: (yield from stream_eval))
 
+# ── 2b. Map to (anchor, positive, negative) triplets ─────────────────────────
+
+def create_embedding_examples(example):
+    return {
+        "anchor":   example["question"],
+        "positive": example["context"],
+        "negative": example["hard_negative"],  # adjust column name if needed
+    }
+
+train_dataset = train_dataset.map(
+    create_embedding_examples,
+    remove_columns=train_dataset.column_names,
+)
+eval_dataset = eval_dataset.map(
+    create_embedding_examples,
+    remove_columns=eval_dataset.column_names,
+)
+
 # ── 3. Evaluator ─────────────────────────────────────────────────────────────
 # queries[i] is answered by corpus[i] — valid for RAG benchmarks with 1:1 alignment.
 # train passages are appended as distractors to make retrieval harder.
 
-queries      = dict(enumerate(eval_dataset["question"]))
+queries      = dict(enumerate(eval_dataset["anchor"]))
 corpus       = dict(enumerate(
-    list(eval_dataset["passage_text"]) + train_dataset["passage_text"][:2000]
+    list(eval_dataset["positive"]) + train_dataset["positive"][:2000]
 ))
 relevant_docs = {idx: [idx] for idx in queries}
 
@@ -137,6 +155,9 @@ evaluator = InformationRetrievalEvaluator(
     relevant_docs=relevant_docs,
     show_progress_bar=False,
     batch_size=64,
+    recall_at_k=[5, 10],
+    mrr_at_k=[10],
+    ndcg_at_k=[10],
 )
 
 # Baseline score before training
@@ -146,7 +167,8 @@ with torch.autocast(device_type="cuda", dtype=autocast_dtype):
 
 # ── 5. Loss function ──────────────────────────────────────────────────────────
 
-loss = MultipleNegativesRankingLoss(model)
+loss = TripletLoss(model)
+# loss = MultipleNegativesRankingLoss(model)  # alternative: in-batch negatives, no explicit negative column needed
 
 # ── 6. Training arguments ─────────────────────────────────────────────────────
 
