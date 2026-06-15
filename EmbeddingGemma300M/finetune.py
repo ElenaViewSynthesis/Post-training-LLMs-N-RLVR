@@ -13,8 +13,9 @@ import os
 from dataclasses import dataclass, field
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from sentence_transformers.losses import MultipleNegativesRankingLoss
 from unsloth import FastSentenceTransformer
 
@@ -52,7 +53,7 @@ TARGET_MODULES = {
 @dataclass
 class Config:
     model_id: str        = "unsloth/embeddinggemma-300m"
-    dataset_id: str      = "sentence-transformers/natural-questions-hard-negatives"
+    dataset_id: str      = "grasson/t2-ragbench"
     output_adapters: str = "output/lora-adapters"
     output_merged: str   = "output/merged-model"
     hub_repo: str        = ""           # set to push: "your-hf-username/embeddinggemma-finetuned"
@@ -109,18 +110,45 @@ model.print_trainable_parameters()
 # ── 2. Dataset ────────────────────────────────────────────────────────────────
 
 print(f"Loading dataset {cfg.dataset_id} ...")
-dataset = load_dataset(cfg.dataset_id, split="train")
 
-# Expected columns: anchor, positive, negative
-# MultipleNegativesRankingLoss uses (anchor, positive) pairs;
-# hard negatives are picked up automatically when a "negative" column exists.
-train_dataset = dataset.select_columns(["anchor", "positive", "negative"])
+stream_train = list(
+    load_dataset(cfg.dataset_id, split="train", streaming=True).take(10000)
+)
+stream_eval = list(
+    load_dataset(cfg.dataset_id, split="validation", streaming=True).take(2000)
+)
 
-# ── 3. Loss function ──────────────────────────────────────────────────────────
+train_dataset = Dataset.from_generator(lambda: (yield from stream_train))
+eval_dataset  = Dataset.from_generator(lambda: (yield from stream_eval))
+
+# ── 3. Evaluator ─────────────────────────────────────────────────────────────
+# queries[i] is answered by corpus[i] — valid for RAG benchmarks with 1:1 alignment.
+# train passages are appended as distractors to make retrieval harder.
+
+queries      = dict(enumerate(eval_dataset["question"]))
+corpus       = dict(enumerate(
+    list(eval_dataset["passage_text"]) + train_dataset["passage_text"][:2000]
+))
+relevant_docs = {idx: [idx] for idx in queries}
+
+evaluator = InformationRetrievalEvaluator(
+    queries=queries,
+    corpus=corpus,
+    relevant_docs=relevant_docs,
+    show_progress_bar=False,
+    batch_size=64,
+)
+
+# Baseline score before training
+autocast_dtype = torch.bfloat16 if cfg.bf16 else torch.float16
+with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+    print("Baseline evaluator score:", evaluator(model))
+
+# ── 5. Loss function ──────────────────────────────────────────────────────────
 
 loss = MultipleNegativesRankingLoss(model)
 
-# ── 4. Training arguments ─────────────────────────────────────────────────────
+# ── 6. Training arguments ─────────────────────────────────────────────────────
 
 args = SentenceTransformerTrainingArguments(
     output_dir=cfg.output_adapters,
@@ -131,19 +159,21 @@ args = SentenceTransformerTrainingArguments(
     warmup_ratio=cfg.warmup_ratio,
     fp16=cfg.fp16,
     bf16=cfg.bf16,
-    gradient_checkpointing=cfg.gradient_checkpointing,
+    gradient_checkpointing=cfg.use_gradient_checkpointing,
     save_strategy="epoch",
     logging_steps=50,
     report_to="none",
 )
 
-# ── 5. Train ──────────────────────────────────────────────────────────────────
+# ── 7. Train ──────────────────────────────────────────────────────────────────
 
 trainer = SentenceTransformerTrainer(
     model=model,
     args=args,
     train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
     loss=loss,
+    evaluator=evaluator,
 )
 
 print("Starting training ...")
