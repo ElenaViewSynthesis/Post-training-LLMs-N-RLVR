@@ -85,13 +85,26 @@ scores   = reranker.predict([("your query", doc) for doc in documents])
 |---:|---|
 | 1 | Load model via `FastSentenceTransformer` |
 | 2 | Apply LoRA (`r=16`) to attention projections |
-| 3 | Load `natural-questions-hard-negatives` dataset |
-| 4 | Train with `MultipleNegativesRankingLoss` |
-| 5 | Save LoRA adapters → `output/lora-adapters/` |
-| 6 | Merge adapters into base model → `output/merged-model/` |
-| 7 | (Optional) push both to Hugging Face Hub |
-| 8 | Load merged model into vLLM with `task="embed"` |
-| 9 | Run cosine similarity on query / document pairs |
+| 3 | Stream `grasson/t2-ragbench` (10k train / 2k eval) |
+| 4 | Map to `(anchor, positive, negative)` triplets |
+| 5 | Baseline IR evaluation before training |
+| 6 | Train with `TripletLoss` |
+| 7 | Save LoRA adapters → `output/lora-adapters/` |
+| 8 | Merge adapters into base model → `output/merged-model/` |
+| 9 | (Optional) push both to Hugging Face Hub |
+| 10 | Load merged model into vLLM with `task="embed"` |
+| 11 | Run cosine similarity on query / document pairs |
+
+### Evaluation Metrics
+
+Evaluated after every epoch using `InformationRetrievalEvaluator` on the `grasson/t2-ragbench` validation set:
+
+| Metric | Why it matters |
+|---|---|
+| **Recall@5** | Are the relevant passages in the top 5 results? Most critical for RAG — if the right chunk isn't retrieved, the LLM can't use it. |
+| **Recall@10** | Broader retrieval window — useful when passing more context to the LLM. |
+| **MRR@10** | Mean Reciprocal Rank — how early the first relevant result appears in the top 10. |
+| **NDCG@10** | Normalized Discounted Cumulative Gain — measures ranking quality, penalising relevant results pushed lower. |
 
 ```bash
 python finetune.py
