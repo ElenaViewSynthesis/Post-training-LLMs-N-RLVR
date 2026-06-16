@@ -10,7 +10,7 @@ fi
 # ── 1. Install uv if not present ──────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
-  source "$HOME/.local/bin/env"
+  export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # ── 2. Create / activate venv ─────────────────────────────────────────────────
