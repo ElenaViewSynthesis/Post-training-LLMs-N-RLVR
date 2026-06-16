@@ -5,6 +5,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "torch",
+    "numpy",
     "torchao>=0.16.0",
     "transformers==4.56.2",
     "sentencepiece",
