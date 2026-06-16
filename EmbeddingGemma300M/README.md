@@ -26,18 +26,59 @@ The demo downloads the models automatically on first run and works on CPU. No CU
 
 ## Setup
 
-### WSL / Linux
+### GPU Training (Lambda Cloud)
+
+**1. SSH into the instance**
+
+```bash
+ssh ubuntu@<your-instance-ip>
+```
+
+**2. Clone the repo**
+
+```bash
+git clone https://github.com/ElenaViewSynthesis/Post-training-LLMs-N-RLVR.git
+cd Post-training-LLMs-N-RLVR/EmbeddingGemma300M
+```
+
+**3. Create `.env`** with your API keys (never commit this file — it is gitignored):
+
+```bash
+# .env
+HF_TOKEN=hf_...
+WANDB_API_KEY=wandb_v1_...
+WANDB_PROJECT=EmbeddingGemma300M
+```
+
+**4. Run the install script**
+
+```bash
+bash install.sh
+```
+
+This creates a `.venv` with Python 3.11 and installs all dependencies (Unsloth, SentenceTransformers, TRL, wandb, weave, vLLM, etc.).
+
+**5. Activate the environment**
+
+```bash
+source .venv/bin/activate
+```
+
+**6. Start training**
+
+```bash
+python finetune.py
+```
+
+Credentials are loaded from `.env` automatically — no manual `hf auth login` or `wandb login` needed. Training metrics stream to your W&B project in real time.
+
+---
+
+### WSL / Linux (local)
 
 ```bash
 chmod +x install.sh
 bash install.sh
-```
-
-This creates a `.venv` with Python 3.11 and installs all dependencies (Unsloth, SentenceTransformers, TRL, wandb, weave, etc.).
-
-Then activate the environment and run the demo:
-
-```bash
 source .venv/bin/activate
 python demo.py
 ```
@@ -48,30 +89,25 @@ python demo.py
 pip install sentence-transformers unsloth
 ```
 
-### Authentication
+### Authentication (manual login alternative)
 
-**Hugging Face** — required to push adapters or merged models to the Hub:
+If you prefer not to use `.env`, you can log in interactively once per environment:
+
+**Hugging Face**
 
 ```bash
 hf auth login
 ```
 
-Paste your token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens). Only needed once per environment; `push_to_hub()` calls will pick it up automatically.
+Paste your token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
 
-**Weights & Biases** — required for training run tracking:
+**Weights & Biases**
 
 ```bash
 wandb login
 ```
 
-Paste your API key from [wandb.ai/authorize](https://wandb.ai/authorize). Alternatively, set both in `.env` and they will be loaded automatically at runtime:
-
-```bash
-# .env
-HF_TOKEN=hf_...
-WANDB_API_KEY=wandb_v1_...
-WANDB_PROJECT=EmbeddingGemma300M
-```
+Paste your API key from [wandb.ai/authorize](https://wandb.ai/authorize).
 
 ## Usage
 
