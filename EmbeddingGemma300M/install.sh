@@ -51,4 +51,7 @@ uv pip install --no-deps --upgrade "torchao>=0.16.0"
 # ── 8. vLLM ───────────────────────────────────────────────────────────────────
 uv pip install vllm
 
+# ── 9. Experiment tracking ────────────────────────────────────────────────────
+uv pip install wandb weave
+
 echo "✓ Environment ready"

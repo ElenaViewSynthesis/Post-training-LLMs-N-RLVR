@@ -22,6 +22,8 @@ dependencies = [
     "vllm",
     "sentence-transformers",
     "python-dotenv",
+    "wandb",
+    "weave",
 ]
 
 [project.optional-dependencies]
