@@ -13,6 +13,9 @@ Models supported:
 import os
 from dataclasses import dataclass, field
 
+# unsloth must be imported before transformers / peft
+from unsloth import FastSentenceTransformer
+
 import torch
 import wandb
 from dotenv import load_dotenv
@@ -24,9 +27,8 @@ WANDB_PROJECT = os.getenv("WANDB_PROJECT", "EmbeddingGemma300M")
 
 from datasets import load_dataset, Dataset
 from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
-from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from sentence_transformers.losses import TripletLoss, MultipleNegativesRankingLoss
-from unsloth import FastSentenceTransformer
+from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
+from sentence_transformers.sentence_transformer.losses import TripletLoss, MultipleNegativesRankingLoss
 
 # ── Per-model sequence length limits ─────────────────────────────────────────
 # Long documents: use the model's full context window.
