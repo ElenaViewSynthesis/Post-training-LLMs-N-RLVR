@@ -3,10 +3,16 @@ set -euo pipefail
 
 # ── 0. System CUDA dependencies ───────────────────────────────────────────────
 sudo apt-get update
-sudo apt-get install -y cuda-nvjitlink-12-4
+sudo apt-get install -y libnvjitlink12
 if ! command -v nvidia-smi &>/dev/null; then
   sudo apt-get install -y nvidia-utils-535
 fi
+
+# ── 0b. Persist CUDA lib path so bitsandbytes can find libnvJitLink ──────────
+if ! grep -q 'cuda/lib64' ~/.bashrc; then
+  echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+fi
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 # ── 1. Install uv if not present ──────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
