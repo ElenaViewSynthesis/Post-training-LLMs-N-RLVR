@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── 0. NVIDIA utils (nvidia-smi) — skipped if already present ────────────────
+# ── 0. System CUDA dependencies ───────────────────────────────────────────────
+sudo apt-get update
+sudo apt-get install -y cuda-nvjitlink-12-4
 if ! command -v nvidia-smi &>/dev/null; then
-  sudo apt-get update
   sudo apt-get install -y nvidia-utils-535
 fi
 
@@ -32,6 +33,7 @@ echo "→ xformers pin: ${TORCH_VER}"
 
 # ── 5. Core deps (with full resolver) ─────────────────────────────────────────
 uv pip install \
+  numpy \
   sentencepiece protobuf \
   "datasets==4.3.0" \
   "huggingface_hub>=0.34.0" \
