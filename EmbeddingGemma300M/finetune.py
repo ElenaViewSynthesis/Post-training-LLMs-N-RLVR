@@ -169,7 +169,6 @@ def create_embedding_examples(example):
     return {
         "anchor":   example["question"],
         "positive": example["context"],
-        "negative": example["hard_negative"],  # adjust column name if needed
     }
 
 train_dataset = train_dataset.map(
@@ -214,8 +213,9 @@ if __name__ == "__main__":
 
     # ── 5. Loss function ──────────────────────────────────────────────────────────
 
-    loss = TripletLoss(model)
-    # loss = MultipleNegativesRankingLoss(model)  # alternative: in-batch negatives, no explicit negative column needed
+    # TripletLoss requires an explicit negative column — use when hard negatives are available
+    # loss = TripletLoss(model)
+    loss = MultipleNegativesRankingLoss(model)  # in-batch negatives, no explicit negative column needed
 
     # ── 6. Training arguments ─────────────────────────────────────────────────────
 
