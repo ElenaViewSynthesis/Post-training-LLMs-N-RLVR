@@ -137,31 +137,20 @@ print(f"Loading dataset {cfg.dataset_id} ...")
 
 FINANCE_SUBSET = "ConvFinQA"
 
-stream_train = list(
+# ConvFinQA has a single split "turn_0" — load and split manually
+full_data = list(
     load_dataset(
         cfg.dataset_id,
         FINANCE_SUBSET,
-        split="train",
+        split="turn_0",
         streaming=True,
-    ).take(13000)
+    ).take(15000)
 )
 
-stream_eval = list(
-    load_dataset(
-        cfg.dataset_id,
-        FINANCE_SUBSET,
-        split="dev",
-        streaming=True,
-    ).take(2000)
-)
-
-train_dataset = Dataset.from_generator(
-    lambda: (yield from stream_train)
-)
-
-eval_dataset = Dataset.from_generator(
-    lambda: (yield from stream_eval)
-)
+full_dataset = Dataset.from_generator(lambda: (yield from full_data))
+split        = full_dataset.train_test_split(test_size=2000, seed=cfg.random_state)
+train_dataset = split["train"]
+eval_dataset  = split["test"]
 
 # ── 2b. Map to (anchor, positive) pairs ──────────────────────────────────────
 
