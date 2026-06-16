@@ -135,15 +135,33 @@ print(f"{start_gpu_memory} GB of memory reserved.")
 
 print(f"Loading dataset {cfg.dataset_id} ...")
 
+FINANCE_SUBSET = "FinQA"
+
 stream_train = list(
-    load_dataset(cfg.dataset_id, split="train", streaming=True).take(10000)
-)
-stream_eval = list(
-    load_dataset(cfg.dataset_id, split="validation", streaming=True).take(2000)
+    load_dataset(
+        cfg.dataset_id,
+        FINANCE_SUBSET,
+        split="train",
+        streaming=True,
+    ).take(8000)
 )
 
-train_dataset = Dataset.from_generator(lambda: (yield from stream_train))
-eval_dataset  = Dataset.from_generator(lambda: (yield from stream_eval))
+stream_eval = list(
+    load_dataset(
+        cfg.dataset_id,
+        FINANCE_SUBSET,
+        split="dev",
+        streaming=True,
+    ).take(1500)
+)
+
+train_dataset = Dataset.from_generator(
+    lambda: (yield from stream_train)
+)
+
+eval_dataset = Dataset.from_generator(
+    lambda: (yield from stream_eval)
+)
 
 # ── 2b. Map to (anchor, positive, negative) triplets ─────────────────────────
 
