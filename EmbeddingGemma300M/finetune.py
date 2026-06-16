@@ -283,6 +283,12 @@ if __name__ == "__main__":
     print(f"Merging and saving to {cfg.output_merged} ...")
     model.save_pretrained_merged(cfg.output_merged)
 
+    # ── 9b. Save full model state dict as .pt ────────────────────────────────────
+    # Portable PyTorch checkpoint — reload with torch.load() for custom inference.
+    pt_path = f"{cfg.output_merged}/embeddinggemma_finetuned.pt"
+    torch.save(model.state_dict(), pt_path)
+    print(f"Saved PyTorch checkpoint to {pt_path}")
+
     # ── 10. (Optional) Push to Hugging Face Hub ──────────────────────────────────
 
     if cfg.hub_repo:
