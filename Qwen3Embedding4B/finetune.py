@@ -1,0 +1,355 @@
+"""
+Full fine-tuning pipeline for embedding models using Unsloth + LoRA,
+followed by vLLM serving of the merged model.
+
+Models supported:
+  unsloth/embeddinggemma-300m
+  unsloth/Qwen3-Embedding-0.6B
+  unsloth/Qwen3-Embedding-4B
+  unsloth/all-MiniLM-L6-v2
+  unsloth/bge-reranker-v2-m3
+"""
+
+import os
+from dataclasses import dataclass, field
+
+# unsloth must be imported before transformers / peft
+from unsloth import FastSentenceTransformer
+
+import torch
+import wandb
+from dotenv import load_dotenv
+
+load_dotenv()
+HF_TOKEN      = os.getenv("HF_TOKEN")
+WANDB_API_KEY = os.getenv("WANDB_API_KEY")
+WANDB_PROJECT = os.getenv("WANDB_PROJECT", "Qwen3Embedding4B")
+
+from datasets import load_dataset, Dataset
+from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+from sentence_transformers.sentence_transformer.evaluation import InformationRetrievalEvaluator
+from sentence_transformers.sentence_transformer.losses import TripletLoss, MultipleNegativesRankingLoss
+
+# ── Per-model sequence length limits ─────────────────────────────────────────
+# Long documents: use the model's full context window.
+# Reduce if you hit OOM — memory scales quadratically with sequence length.
+MAX_SEQ_LENGTHS = {
+    "unsloth/embeddinggemma-300m":  8192,
+    "unsloth/Qwen3-Embedding-0.6B": 32768,
+    "unsloth/Qwen3-Embedding-4B":   32768,
+    "unsloth/all-MiniLM-L6-v2":    512,    # hard BERT cap
+    "unsloth/bge-reranker-v2-m3":  8192,
+}
+
+# Batch size drops with longer sequences to keep VRAM stable.
+# Rule of thumb: halve the batch size each time you double the seq length.
+BATCH_SIZES = {
+    "unsloth/embeddinggemma-300m":  4,
+    "unsloth/Qwen3-Embedding-0.6B": 2,
+    "unsloth/Qwen3-Embedding-4B":   1,
+    "unsloth/all-MiniLM-L6-v2":    32,
+    "unsloth/bge-reranker-v2-m3":  4,
+}
+
+# LoRA target modules differ by architecture:
+#   decoder (Gemma, Qwen)   → attention + MLP projection layers
+#   encoder (BERT, RoBERTa) → attention only, different naming
+TARGET_MODULES = {
+    "unsloth/embeddinggemma-300m":  ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+    "unsloth/Qwen3-Embedding-0.6B": ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+    "unsloth/Qwen3-Embedding-4B":   ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+    "unsloth/all-MiniLM-L6-v2":    ("query",  "key",    "value"),
+    "unsloth/bge-reranker-v2-m3":  ("query",  "key",    "value",  "dense"),
+}
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Config:
+    model_id: str        = "unsloth/Qwen3-Embedding-4B"
+    dataset_id: str      = "grasson/t2-ragbench"
+    output_adapters: str = "output/lora-adapters"
+    output_merged: str   = "output/merged-model"
+    hub_repo: str        = ""           # set to push: "your-hf-username/qwen3-embedding-4b-finetuned"
+
+    lora_r: int               = 16        # 8, 16, 32, 64, 128
+    lora_alpha: int           = 32        # 64
+    lora_dropout: float       = 0.05
+    use_rslora: bool          = False     # rank stabilized LoRA
+    loftq_config              = None      # LoftQ quantization config
+    task_type: str            = "FEATURE_EXTRACTION"
+    use_gradient_checkpointing = "unsloth" # True or "unsloth" for very long context
+    random_state: int         = 3407
+
+    @property
+    def target_modules(self) -> tuple:
+        return TARGET_MODULES.get(self.model_id, ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"))
+
+    num_train_epochs: int        = 1
+    gradient_accumulation_steps: int = 8   # effective batch = per_device_batch_size × 8
+    learning_rate: float         = 2e-4
+    warmup_ratio: float          = 0.1
+    fp16: bool                   = not torch.cuda.is_bf16_supported()
+    bf16: bool                   = torch.cuda.is_bf16_supported()
+
+    @property
+    def max_seq_length(self) -> int:
+        return MAX_SEQ_LENGTHS.get(self.model_id, 8192)
+
+    @property
+    def per_device_batch_size(self) -> int:
+        return BATCH_SIZES.get(self.model_id, 4)
+
+cfg = Config()
+
+# ── 1. Load model + apply LoRA ────────────────────────────────────────────────
+
+print(f"Loading {cfg.model_id} ...")
+model = FastSentenceTransformer.from_pretrained(
+    cfg.model_id,
+    max_seq_length=cfg.max_seq_length,
+    full_finetuning = False,
+)
+
+model = FastSentenceTransformer.get_peft_model(
+    model,
+    r=cfg.lora_r,
+    lora_alpha=cfg.lora_alpha,
+    lora_dropout=cfg.lora_dropout,
+    target_modules=list(cfg.target_modules),
+    bias="none",
+)
+try:
+    model.print_trainable_parameters()
+except AttributeError:
+    pass  # SentenceTransformer wrapper does not expose this directly
+
+# ── Memory stats after model + LoRA setup ────────────────────────────────────
+gpu_stats         = torch.cuda.get_device_properties(0)
+start_gpu_memory  = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+max_memory        = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
+print(f"GPU = {gpu_stats.name}. Max memory = {max_memory} GB.")
+print(f"{start_gpu_memory} GB of memory reserved.")
+
+# ── 2. Dataset ────────────────────────────────────────────────────────────────
+
+print(f"Loading dataset {cfg.dataset_id} ...")
+
+FINANCE_SUBSET = "ConFinQA"
+
+stream_train = list(
+    load_dataset(
+        cfg.dataset_id,
+        FINANCE_SUBSET,
+        split="train",
+        streaming=True,
+    ).take(8000)
+)
+
+stream_eval = list(
+    load_dataset(
+        cfg.dataset_id,
+        FINANCE_SUBSET,
+        split="dev",
+        streaming=True,
+    ).take(1500)
+)
+
+train_dataset = Dataset.from_generator(
+    lambda: (yield from stream_train)
+)
+
+eval_dataset = Dataset.from_generator(
+    lambda: (yield from stream_eval)
+)
+
+# ── 2b. Map to (anchor, positive) pairs ──────────────────────────────────────
+
+def create_embedding_examples(example):
+    return {
+        "anchor":   example["question"],
+        "positive": example["context"],
+    }
+
+train_dataset = train_dataset.map(
+    create_embedding_examples,
+    remove_columns=train_dataset.column_names,
+)
+eval_dataset = eval_dataset.map(
+    create_embedding_examples,
+    remove_columns=eval_dataset.column_names,
+)
+
+# ── 3. Evaluator ─────────────────────────────────────────────────────────────
+# queries[i] is answered by corpus[i] — valid for RAG benchmarks with 1:1 alignment.
+# train passages are appended as distractors to make retrieval harder.
+
+queries      = dict(enumerate(eval_dataset["anchor"]))
+corpus       = dict(enumerate(
+    list(eval_dataset["positive"]) + train_dataset["positive"][:2000]
+))
+relevant_docs = {idx: [idx] for idx in queries}
+
+evaluator = InformationRetrievalEvaluator(
+    queries=queries,
+    corpus=corpus,
+    relevant_docs=relevant_docs,
+    show_progress_bar=False,
+    batch_size=64,
+    precision_recall_at_k=[5, 10],
+    mrr_at_k=[10],
+    ndcg_at_k=[10],
+)
+
+# Baseline score before training
+autocast_dtype = torch.bfloat16 if cfg.bf16 else torch.float16
+with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+    print("Baseline evaluator score:", evaluator(model))
+
+if __name__ == "__main__":
+    # ── W&B initialisation ────────────────────────────────────────────────────────
+    wandb.login(key=WANDB_API_KEY)
+    wandb.init(project=WANDB_PROJECT, name=cfg.model_id.split("/")[-1])
+
+    # ── 5. Loss function ──────────────────────────────────────────────────────────
+
+    # TripletLoss requires an explicit negative column — use when hard negatives are available
+    # loss = TripletLoss(model)
+    loss = MultipleNegativesRankingLoss(model)  # in-batch negatives, no explicit negative column needed
+
+    # ── 6. Training arguments ─────────────────────────────────────────────────────
+
+    args = SentenceTransformerTrainingArguments(
+        output_dir=cfg.output_adapters,
+        num_train_epochs=cfg.num_train_epochs,
+        per_device_train_batch_size=cfg.per_device_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        learning_rate=cfg.learning_rate,
+        warmup_ratio=cfg.warmup_ratio,
+        fp16=cfg.fp16,
+        bf16=cfg.bf16,
+        gradient_checkpointing=cfg.use_gradient_checkpointing,
+        save_strategy="epoch",
+        logging_steps=50,
+        report_to="wandb",
+    )
+
+    # ── 7. Train ──────────────────────────────────────────────────────────────────
+
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        loss=loss,
+        evaluator=evaluator,
+    )
+
+    # ── Memory stats before training ─────────────────────────────────────────────
+    pre_train_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    print(f"Memory reserved before training: {pre_train_memory} GB / {max_memory} GB.")
+
+    print("Starting training ...")
+    trainer_stats = trainer.train()
+
+    # ── Final memory and time stats ───────────────────────────────────────────────
+    used_memory            = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
+    used_memory_for_lora   = round(used_memory - start_gpu_memory, 3)
+    used_percentage        = round(used_memory / max_memory * 100, 3)
+    lora_percentage        = round(used_memory_for_lora / max_memory * 100, 3)
+    print(f"{trainer_stats.metrics['train_runtime']} seconds used for training.")
+    print(f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} minutes used for training.")
+    print(f"Peak reserved memory = {used_memory} GB.")
+    print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
+    print(f"Peak reserved memory % of max memory = {used_percentage} %.")
+    print(f"Peak reserved memory for training % of max memory = {lora_percentage} %.")
+
+    # ── Post-training evaluation ──────────────────────────────────────────────────
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_dtype != torch.float16):
+        print("Post-training evaluator score:", evaluator(model))
+
+    # ── 8. Save LoRA adapters only (16-bit) ──────────────────────────────────────
+    # Saves adapter weights + tokenizer. Does NOT include base model weights.
+    # Reload with: FastSentenceTransformer.from_pretrained(path, for_inference=True)
+
+    print(f"Saving LoRA adapters to {cfg.output_adapters} ...")
+    model.save_pretrained(cfg.output_adapters)
+    model.tokenizer.save_pretrained(cfg.output_adapters)
+    model.push_to_hub("borntobeignored/qwen3-embedding-4b_lora", token=HF_TOKEN)
+    model.tokenizer.push_to_hub("borntobeignored/qwen3-embedding-4b_lora", token=HF_TOKEN)
+
+    # ── 9. Merge adapters into base model and save ────────────────────────────────
+
+    print(f"Merging and saving to {cfg.output_merged} ...")
+    model.save_pretrained_merged(cfg.output_merged)
+
+    # ── 9b. Save full model state dict as .pt ────────────────────────────────────
+    # Portable PyTorch checkpoint — reload with torch.load() for custom inference.
+    pt_path = f"{cfg.output_merged}/qwen3_embedding_4b_finetuned.pt"
+    torch.save(model.state_dict(), pt_path)
+    print(f"Saved PyTorch checkpoint to {pt_path}")
+
+    # ── 10. (Optional) Push to Hugging Face Hub ──────────────────────────────────
+
+    if cfg.hub_repo:
+        print(f"Pushing adapters to {cfg.hub_repo} ...")
+        model.push_to_hub(cfg.hub_repo)
+        model.push_to_hub_merged(f"{cfg.hub_repo}-merged")
+
+    # ── 11. vLLM inference on the merged model ────────────────────────────────────
+
+    print("Loading merged model into vLLM ...")
+    from vllm import LLM
+
+    llm = LLM(
+        model=cfg.output_merged,
+        task="embed",
+        dtype="bfloat16" if cfg.bf16 else "float16",
+        max_model_len=cfg.max_seq_length,
+    )
+
+    # Hardcoded financial domain examples
+    test_queries = [
+        "What was Microsoft's revenue growth in Q3 2024?",
+        "How did Apple perform in terms of iPhone sales last quarter?",
+        "What are NVIDIA's data center revenue trends?",
+        "How is JPMorgan managing credit risk in the current environment?",
+    ]
+    test_documents = [
+        "Microsoft reported strong Q3 2024 results with revenue growing 17% year-over-year, driven by Azure cloud services and AI product adoption.",
+        "Apple's iPhone sales declined slightly last quarter amid weak demand in China, though services revenue hit a record high.",
+        "NVIDIA's data center segment surged over 400% year-over-year, fueled by explosive demand for H100 GPUs used in AI training workloads.",
+        "JPMorgan Chase increased its loan loss reserves amid rising charge-offs and uncertainty around consumer credit quality in a higher-rate environment.",
+    ]
+
+    # Append live examples from the evaluation set
+    sample_rows = eval_dataset.select(range(4))
+    test_queries   = test_queries   + list(sample_rows["anchor"])
+    test_documents = test_documents + list(sample_rows["positive"])
+
+    query_outputs    = llm.embed(test_queries)
+    document_outputs = llm.embed(test_documents)
+
+    query_vecs = torch.tensor([o.outputs.embedding for o in query_outputs])
+    doc_vecs   = torch.tensor([o.outputs.embedding for o in document_outputs])
+
+    # Pair-wise scores: each query is matched only against its corresponding document (diagonal).
+    # Useful for sanity-checking that the model assigns high similarity to correct pairs.
+    similarity = torch.nn.functional.cosine_similarity(query_vecs, doc_vecs)
+    print("\n── Pair-wise cosine similarity (query[i] ↔ document[i]) ──")
+    for q, d, s in zip(test_queries, test_documents, similarity):
+        print(f"\nQuery:    {q}")
+        print(f"Document: {d}")
+        print(f"Score:    {s:.4f}")
+
+    # Full similarity matrix: every query scored against every document.
+    # Ranking shows which document the model retrieves first for query[0].
+    sim_matrix = query_vecs @ doc_vecs.T   # (n_queries, n_docs)
+    ranking = sim_matrix.argsort(descending=True)[0]
+
+    print("\n── Ranked retrieval — query[0] vs all documents (descending score) ──")
+    for idx in ranking.tolist():
+        print(
+            f"{sim_matrix[0][idx]:.4f} | "
+            f"{test_documents[idx][:100]}"
+        )
