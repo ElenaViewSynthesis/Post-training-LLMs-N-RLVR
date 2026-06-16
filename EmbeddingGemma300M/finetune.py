@@ -196,7 +196,7 @@ evaluator = InformationRetrievalEvaluator(
     relevant_docs=relevant_docs,
     show_progress_bar=False,
     batch_size=64,
-    recall_at_k=[5, 10],
+    precision_recall_at_k=[5, 10],
     mrr_at_k=[10],
     ndcg_at_k=[10],
 )
