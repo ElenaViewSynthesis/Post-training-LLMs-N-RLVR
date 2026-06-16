@@ -28,6 +28,8 @@ The demo downloads the models automatically on first run and works on CPU. No CU
 
 ### GPU Training (Lambda Cloud)
 
+> **Important:** When creating your Lambda instance, select the **Lambda Stack** image (not plain Ubuntu). The Lambda Stack image comes with CUDA, cuDNN, and NVIDIA drivers pre-installed and pre-configured. Using a plain Ubuntu image requires manual driver setup.
+
 **1. SSH into the instance**
 
 ```bash
