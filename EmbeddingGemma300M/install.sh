@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ── 0. NVIDIA utils (nvidia-smi) — skipped if already present ────────────────
+if ! command -v nvidia-smi &>/dev/null; then
+  sudo apt-get update
+  sudo apt-get install -y nvidia-utils-535
+fi
+
 # ── 1. Install uv if not present ──────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
   curl -LsSf https://astral.sh/uv/install.sh | sh

@@ -50,7 +50,26 @@ WANDB_API_KEY=wandb_v1_...
 WANDB_PROJECT=EmbeddingGemma300M
 ```
 
-**4. Run the install script**
+**4. Verify the GPU is visible**
+
+```bash
+lspci | grep -i nvidia
+```
+
+Expected output: something like `NVIDIA Corporation GA100 [A100 SXM4 40GB]`. If `nvidia-smi` is not found, update the package cache first then install:
+
+```bash
+sudo apt-get update && sudo apt install -y nvidia-utils-535
+nvidia-smi
+```
+
+Then confirm torch can see the GPU:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+**5. Run the install script**
 
 ```bash
 bash install.sh
@@ -58,13 +77,13 @@ bash install.sh
 
 This creates a `.venv` with Python 3.11 and installs all dependencies (Unsloth, SentenceTransformers, TRL, wandb, weave, vLLM, etc.).
 
-**5. Activate the environment**
+**6. Activate the environment**
 
 ```bash
 source .venv/bin/activate
 ```
 
-**6. Start training**
+**7. Start training**
 
 ```bash
 python finetune.py
