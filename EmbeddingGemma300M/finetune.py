@@ -5,6 +5,7 @@ followed by vLLM serving of the merged model.
 Models supported:
   unsloth/embeddinggemma-300m
   unsloth/Qwen3-Embedding-0.6B
+  unsloth/Qwen3-Embedding-4B
   unsloth/all-MiniLM-L6-v2
   unsloth/bge-reranker-v2-m3
 """
@@ -13,10 +14,13 @@ import os
 from dataclasses import dataclass, field
 
 import torch
+import wandb
 from dotenv import load_dotenv
 
 load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN      = os.getenv("HF_TOKEN")
+WANDB_API_KEY = os.getenv("WANDB_API_KEY")
+WANDB_PROJECT = os.getenv("WANDB_PROJECT", "EmbeddingGemma300M")
 
 from datasets import load_dataset, Dataset
 from sentence_transformers import SentenceTransformerTrainer, SentenceTransformerTrainingArguments
@@ -30,6 +34,7 @@ from unsloth import FastSentenceTransformer
 MAX_SEQ_LENGTHS = {
     "unsloth/embeddinggemma-300m":  8192,
     "unsloth/Qwen3-Embedding-0.6B": 32768,
+    "unsloth/Qwen3-Embedding-4B":   32768,
     "unsloth/all-MiniLM-L6-v2":    512,    # hard BERT cap
     "unsloth/bge-reranker-v2-m3":  8192,
 }
@@ -39,6 +44,7 @@ MAX_SEQ_LENGTHS = {
 BATCH_SIZES = {
     "unsloth/embeddinggemma-300m":  4,
     "unsloth/Qwen3-Embedding-0.6B": 2,
+    "unsloth/Qwen3-Embedding-4B":   1,
     "unsloth/all-MiniLM-L6-v2":    32,
     "unsloth/bge-reranker-v2-m3":  4,
 }
@@ -49,6 +55,7 @@ BATCH_SIZES = {
 TARGET_MODULES = {
     "unsloth/embeddinggemma-300m":  ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     "unsloth/Qwen3-Embedding-0.6B": ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
+    "unsloth/Qwen3-Embedding-4B":   ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"),
     "unsloth/all-MiniLM-L6-v2":    ("query",  "key",    "value"),
     "unsloth/bge-reranker-v2-m3":  ("query",  "key",    "value",  "dense"),
 }
@@ -178,6 +185,10 @@ with torch.autocast(device_type="cuda", dtype=autocast_dtype):
     print("Baseline evaluator score:", evaluator(model))
 
 if __name__ == "__main__":
+    # ── W&B initialisation ────────────────────────────────────────────────────────
+    wandb.login(key=WANDB_API_KEY)
+    wandb.init(project=WANDB_PROJECT, name=cfg.model_id.split("/")[-1])
+
     # ── 5. Loss function ──────────────────────────────────────────────────────────
 
     loss = TripletLoss(model)
@@ -197,7 +208,7 @@ if __name__ == "__main__":
         gradient_checkpointing=cfg.use_gradient_checkpointing,
         save_strategy="epoch",
         logging_steps=50,
-        report_to="none",
+        report_to="wandb",
     )
 
     # ── 7. Train ──────────────────────────────────────────────────────────────────
