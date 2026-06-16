@@ -4,7 +4,7 @@ set -euo pipefail
 # ── 1. Install uv if not present ──────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
-  source "$HOME/.cargo/env"
+  source "$HOME/.local/bin/env"
 fi
 
 # ── 2. Create / activate venv ─────────────────────────────────────────────────
