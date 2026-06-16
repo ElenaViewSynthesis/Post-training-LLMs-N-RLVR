@@ -36,7 +36,7 @@ from sentence_transformers.sentence_transformer.losses import TripletLoss, Multi
 MAX_SEQ_LENGTHS = {
     "unsloth/embeddinggemma-300m":  8192,
     "unsloth/Qwen3-Embedding-0.6B": 32768,
-    "unsloth/Qwen3-Embedding-4B":   32768,
+    "unsloth/Qwen3-Embedding-4B":   4096,   # capped for A100 40GB; use 80GB for full 32k context
     "unsloth/all-MiniLM-L6-v2":    512,    # hard BERT cap
     "unsloth/bge-reranker-v2-m3":  8192,
 }
@@ -190,7 +190,7 @@ evaluator = InformationRetrievalEvaluator(
     corpus=corpus,
     relevant_docs=relevant_docs,
     show_progress_bar=False,
-    batch_size=64,
+    batch_size=8,
     precision_recall_at_k=[5, 10],
     mrr_at_k=[10],
     ndcg_at_k=[10],

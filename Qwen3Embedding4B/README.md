@@ -4,11 +4,15 @@ Fine-tuning `unsloth/Qwen3-Embedding-4B` on the ConvFinQA subset of `grasson/t2-
 
 ## GPU Requirements
 
-| Mode | VRAM | Recommended instance |
-|---|---|---|
-| LoRA 16-bit (this config) | ~40–48 GB | A100 80GB |
-| QLoRA 4-bit | ~18–22 GB | A100 40GB (reduce `max_seq_length` if OOM) |
-| Full fine-tuning | 80 GB+ | H100 80GB |
+| Mode | Seq length | VRAM | Recommended instance |
+|---|---|---|---|
+| LoRA 16-bit (this config) | 4,096 | ~22–28 GB | A100 40GB |
+| LoRA 16-bit | 32,768 (full context) | ~40–48 GB | A100 80GB |
+| QLoRA 4-bit | 4,096 | ~12–16 GB | A10 24GB |
+| QLoRA 4-bit | 32,768 (full context) | ~18–22 GB | A100 40GB |
+| Full fine-tuning | 32,768 | 80 GB+ | H100 80GB |
+
+> **Note:** The default `max_seq_length` in this config is **4,096** to fit an A100 40GB. To use the full 32k context window, switch to an **A100 80GB** instance and set `max_seq_length = 32768` in `MAX_SEQ_LENGTHS`.
 
 > **Note:** Use the **Lambda Stack** image when launching — not plain Ubuntu. It comes with CUDA, cuDNN, and NVIDIA drivers pre-installed.
 
