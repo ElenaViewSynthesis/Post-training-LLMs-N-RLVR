@@ -2,6 +2,14 @@
 
 Embedding and reranker model fine-tuning and inference using [Unsloth](https://github.com/unslothai/unsloth) and [SentenceTransformers](https://github.com/huggingface/sentence-transformers).
 
+## Fine-tuned Model
+
+| Model | Dataset | Hub |
+|---|---|---|
+| `google/embeddinggemma-300m` + LoRA (r=16) | `grasson/t2-ragbench` / FinQA | [borntobeignored/embeddinggemma_lora](https://huggingface.co/borntobeignored/embeddinggemma_lora) |
+
+Fine-tuned on the FinQA subset of T2-RAGBench using `MultipleNegativesRankingLoss` for 1 epoch on an NVIDIA A100 SXM4 40GB. Training completed in **17.9 minutes** with a final loss of **0.0397**. See [`training_logs/`](training_logs/) for full run details.
+
 ## Quick Start (no GPU needed)
 
 Just want to see it run? You only need Python and one package:
