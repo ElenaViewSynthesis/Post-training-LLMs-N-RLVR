@@ -8,11 +8,15 @@ if ! command -v nvidia-smi &>/dev/null; then
   sudo apt-get install -y nvidia-utils-535
 fi
 
-# ── 0b. Persist CUDA lib path so bitsandbytes can find libnvJitLink ──────────
+# ── 0b. Persist CUDA lib paths so bitsandbytes can find libnvJitLink ─────────
+VENV_NVIDIA_LIB="$(pwd)/.venv/lib/python3.11/site-packages/nvidia/cu13/lib"
 if ! grep -q 'cuda/lib64' ~/.bashrc; then
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
 fi
-export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+if ! grep -q 'nvidia/cu13/lib' ~/.bashrc; then
+  echo "export LD_LIBRARY_PATH=${VENV_NVIDIA_LIB}:\$LD_LIBRARY_PATH" >> ~/.bashrc
+fi
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${VENV_NVIDIA_LIB}:$LD_LIBRARY_PATH"
 
 # ── 1. Install uv if not present ──────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
