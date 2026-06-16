@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ── 0. System CUDA dependencies ───────────────────────────────────────────────
 sudo apt-get update
-sudo apt-get install -y libnvjitlink12
+sudo apt-cache search libnvjitlink | awk '{print $1}' | sort -V | tail -1 | xargs sudo apt-get install -y
 if ! command -v nvidia-smi &>/dev/null; then
   sudo apt-get install -y nvidia-utils-535
 fi

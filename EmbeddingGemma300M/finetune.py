@@ -119,7 +119,10 @@ model = FastSentenceTransformer.get_peft_model(
     target_modules=list(cfg.target_modules),
     bias="none",
 )
-model.print_trainable_parameters()
+try:
+    model.print_trainable_parameters()
+except AttributeError:
+    pass  # SentenceTransformer wrapper does not expose this directly
 
 # ── Memory stats after model + LoRA setup ────────────────────────────────────
 gpu_stats         = torch.cuda.get_device_properties(0)
