@@ -33,7 +33,7 @@ chmod +x install.sh
 bash install.sh
 ```
 
-This creates a `.venv` with Python 3.11 and installs all dependencies (Unsloth, SentenceTransformers, TRL, etc.).
+This creates a `.venv` with Python 3.11 and installs all dependencies (Unsloth, SentenceTransformers, TRL, wandb, weave, etc.).
 
 Then activate the environment and run the demo:
 
@@ -46,6 +46,31 @@ python demo.py
 
 ```bash
 pip install sentence-transformers unsloth
+```
+
+### Authentication
+
+**Hugging Face** — required to push adapters or merged models to the Hub:
+
+```bash
+hf auth login
+```
+
+Paste your token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens). Only needed once per environment; `push_to_hub()` calls will pick it up automatically.
+
+**Weights & Biases** — required for training run tracking:
+
+```bash
+wandb login
+```
+
+Paste your API key from [wandb.ai/authorize](https://wandb.ai/authorize). Alternatively, set both in `.env` and they will be loaded automatically at runtime:
+
+```bash
+# .env
+HF_TOKEN=hf_...
+WANDB_API_KEY=wandb_v1_...
+WANDB_PROJECT=EmbeddingGemma300M
 ```
 
 ## Usage
@@ -110,7 +135,7 @@ Evaluated after every epoch using `InformationRetrievalEvaluator` on the `grasso
 python finetune.py
 ```
 
-To switch models or tune hyperparameters, edit the `Config` dataclass at the top of `finetune.py`. To push to the Hub, set `hub_repo = "your-username/model-name"` and run `hf auth login` first.
+To switch models or tune hyperparameters, edit the `Config` dataclass at the top of `finetune.py`. To push to the Hub, set `hub_repo = "your-username/model-name"` — credentials are loaded from `.env` automatically. Training metrics are logged to the W&B project set in `WANDB_PROJECT`.
 
 ```python
 from unsloth import FastSentenceTransformer
