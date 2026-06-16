@@ -275,8 +275,8 @@ if __name__ == "__main__":
     print(f"Saving LoRA adapters to {cfg.output_adapters} ...")
     model.save_pretrained(cfg.output_adapters)
     model.tokenizer.save_pretrained(cfg.output_adapters)
-    model.push_to_hub("borntobeignored/embeddinggemma_lora", token=HF_TOKEN)
-    model.tokenizer.push_to_hub("borntobeignored/embeddinggemma_lora", token=HF_TOKEN)
+    model.push_to_hub("elenamylocuda/embeddinggemma_lora", token=HF_TOKEN)
+    model.tokenizer.push_to_hub("elenamylocuda/embeddinggemma_lora", token=HF_TOKEN)
 
     # ── 9. Merge adapters into base model and save ────────────────────────────────
 
