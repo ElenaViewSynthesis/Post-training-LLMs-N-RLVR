@@ -268,28 +268,6 @@ if __name__ == "__main__":
     with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_dtype != torch.float16):
         print("Post-training evaluator score:", evaluator(model))
 
-    # ── Post-training inference example ──────────────────────────────────────────
-    # Replace query and candidates with examples from your domain.
-    query = "Patient presents with sharp chest pain that improves when leaning forward."
-
-    candidates = [
-        "Acute Pericarditis often involves pleuritic chest pain relieved by sitting up and leaning forward.",
-        "Myocardial Infarction typically presents with crushing substernal pressure and radiation to the left arm.",
-        "Pneumothorax is characterized by sudden onset shortness of breath and unilateral chest pain.",
-        "Gastroesophageal Reflux Disease (GERD) causes burning retrosternal pain usually after meals.",
-    ]
-
-    query_emb      = model.encode(query, convert_to_tensor=True)
-    candidate_embs = model.encode(candidates, convert_to_tensor=True)
-    similarities   = model.similarity(query_emb, candidate_embs)
-
-    ranking = similarities.argsort(descending=True)[0]
-
-    print(f"\nQuery: {query}\n")
-    for idx in ranking.tolist():
-        score = similarities[0][idx].item()
-        print(f"{score:.4f} | {candidates[idx]}")
-
     # ── 8. Save LoRA adapters only (16-bit) ──────────────────────────────────────
     # Saves adapter weights + tokenizer. Does NOT include base model weights.
     # Reload with: FastSentenceTransformer.from_pretrained(path, for_inference=True)
