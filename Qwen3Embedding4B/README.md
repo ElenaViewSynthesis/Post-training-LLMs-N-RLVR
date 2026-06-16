@@ -1,0 +1,87 @@
+# Qwen3-Embedding-4B Fine-tuning
+
+Fine-tuning `unsloth/Qwen3-Embedding-4B` on the ConvFinQA subset of `grasson/t2-ragbench` using Unsloth + LoRA.
+
+## GPU Requirements
+
+| Mode | VRAM | Recommended instance |
+|---|---|---|
+| LoRA 16-bit (this config) | ~40–48 GB | A100 80GB |
+| QLoRA 4-bit | ~18–22 GB | A100 40GB (reduce `max_seq_length` if OOM) |
+| Full fine-tuning | 80 GB+ | H100 80GB |
+
+> **Note:** Use the **Lambda Stack** image when launching — not plain Ubuntu. It comes with CUDA, cuDNN, and NVIDIA drivers pre-installed.
+
+## CUDA Setup
+
+After SSH-ing into the instance, verify the GPU and fix the `libnvJitLink` path before running training:
+
+```bash
+# Verify GPU
+nvidia-smi
+lspci | grep -i nvidia
+
+# Fix libnvJitLink path (required for bitsandbytes on CUDA 13.x)
+export LD_LIBRARY_PATH=.venv/lib/python3.11/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
+```
+
+To make the path permanent:
+
+```bash
+echo 'export LD_LIBRARY_PATH=/path/to/Qwen3Embedding4B/.venv/lib/python3.11/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+## Setup
+
+```bash
+git clone https://github.com/ElenaViewSynthesis/Post-training-LLMs-N-RLVR.git
+cd Post-training-LLMs-N-RLVR/Qwen3Embedding4B
+
+# Copy .env from EmbeddingGemma300M or create a new one
+cp ../EmbeddingGemma300M/.env .
+
+bash install.sh
+source .venv/bin/activate
+python finetune.py
+```
+
+## .env
+
+```bash
+HF_TOKEN=hf_...
+WANDB_API_KEY=wandb_v1_...
+WANDB_PROJECT=Qwen3Embedding4B
+```
+
+## Dataset
+
+| Subset | Split | Samples used |
+|---|---|---|
+| ConvFinQA | train | 13,000 |
+| ConvFinQA | dev | 2,000 |
+
+ConvFinQA contains ~14,000 conversational financial QA pairs. Anchors include company name and report year for better contextual retrieval.
+
+## Training Config
+
+| Parameter | Value |
+|---|---|
+| Model | `unsloth/Qwen3-Embedding-4B` |
+| LoRA r | 16 |
+| LoRA alpha | 32 |
+| Batch size | 1 |
+| Gradient accumulation | 8 (effective batch = 8) |
+| Epochs | 1 |
+| Loss | `MultipleNegativesRankingLoss` |
+| Sequence length | 32,768 |
+| Precision | bfloat16 |
+
+## Evaluation Metrics
+
+| Metric | Description |
+|---|---|
+| **Recall@5** | Is the relevant passage in the top 5? |
+| **Recall@10** | Is the relevant passage in the top 10? |
+| **MRR@10** | How early does the first relevant result appear? |
+| **NDCG@10** | Ranking quality — penalises relevant results pushed lower |

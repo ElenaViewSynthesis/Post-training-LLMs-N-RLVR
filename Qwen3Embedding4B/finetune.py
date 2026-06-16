@@ -135,7 +135,7 @@ print(f"{start_gpu_memory} GB of memory reserved.")
 
 print(f"Loading dataset {cfg.dataset_id} ...")
 
-FINANCE_SUBSET = "ConFinQA"
+FINANCE_SUBSET = "ConvFinQA"
 
 stream_train = list(
     load_dataset(
@@ -143,7 +143,7 @@ stream_train = list(
         FINANCE_SUBSET,
         split="train",
         streaming=True,
-    ).take(8000)
+    ).take(13000)
 )
 
 stream_eval = list(
@@ -152,7 +152,7 @@ stream_eval = list(
         FINANCE_SUBSET,
         split="dev",
         streaming=True,
-    ).take(1500)
+    ).take(2000)
 )
 
 train_dataset = Dataset.from_generator(
@@ -166,8 +166,14 @@ eval_dataset = Dataset.from_generator(
 # ── 2b. Map to (anchor, positive) pairs ──────────────────────────────────────
 
 def create_embedding_examples(example):
+    anchor = (
+        f"Company: {example['company_name']} | "
+        f"Year: {example['report_year']} | "
+        f"Question: {example['question']}"
+    )
+
     return {
-        "anchor":   example["question"],
+        "anchor":  anchor,
         "positive": example["context"],
     }
 
