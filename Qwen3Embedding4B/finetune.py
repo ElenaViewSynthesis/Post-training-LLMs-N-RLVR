@@ -36,7 +36,7 @@ from sentence_transformers.sentence_transformer.losses import TripletLoss, Multi
 MAX_SEQ_LENGTHS = {
     "unsloth/embeddinggemma-300m":  8192,
     "unsloth/Qwen3-Embedding-0.6B": 32768,
-    "unsloth/Qwen3-Embedding-4B":   4096,   # capped for A100 40GB; use 80GB for full 32k context
+    "unsloth/Qwen3-Embedding-4B":   8192,   # 8192 → ~21-22GB on A100 40GB; use 80GB for full 32k context
     "unsloth/all-MiniLM-L6-v2":    512,    # hard BERT cap
     "unsloth/bge-reranker-v2-m3":  8192,
 }
@@ -46,7 +46,7 @@ MAX_SEQ_LENGTHS = {
 BATCH_SIZES = {
     "unsloth/embeddinggemma-300m":  4,
     "unsloth/Qwen3-Embedding-0.6B": 2,
-    "unsloth/Qwen3-Embedding-4B":   1,
+    "unsloth/Qwen3-Embedding-4B":   2,   # ≥2 required for MultipleNegativesRankingLoss to have in-batch negatives
     "unsloth/all-MiniLM-L6-v2":    32,
     "unsloth/bge-reranker-v2-m3":  4,
 }
