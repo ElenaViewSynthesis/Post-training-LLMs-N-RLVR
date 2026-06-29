@@ -58,7 +58,7 @@ Stage 5 — Validation + dedup (schema, structural, near-dup, verifier replay)
 Stage 6 — Merge with original + write 250K parquet → S3
 ```
 
-**Revised to Gemini path:** The design was subsequently updated to use Gemini 3.5 Flash with the Interactions API (real multi-turn sandboxed agent loop) instead of the Anthropic Batches API (single-shot simulated trajectories). With unlimited Gemini requests, cost is no longer the constraint — fidelity is. See `gemini_agent_worker.py` and `README.md` for the full rationale.
+**Revised to Cerebras path:** The design was subsequently updated to use **Gemma-4-31B Early Preview via Cerebras Inference** (`CEREBRAS_API_KEY`) instead of the Anthropic Batches API (single-shot simulated trajectories). The Cerebras async worker runs the real multi-turn agent loop. Temperature variation replaces `thinking_level` as the diversity axis (Gemma-4-31B has no restriction on sampling params). See `gemini_agent_worker.py`, `plan_variants.py`, and `README.md`.
 
 ---
 

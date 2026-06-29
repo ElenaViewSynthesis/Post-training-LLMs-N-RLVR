@@ -1,29 +1,20 @@
 """
-Stage 2 (Gemini 3.x rewrite): Perturbation planner.
+Stage 2: Perturbation planner.
 
-CHANGED vs the original plan: we do NOT perturb temperature/top_p/top_k.
-For Gemini 3.x, Google explicitly recommends leaving sampling params at their
-defaults -- the reasoning path is tuned for them, and nudging them degrades
-trajectory quality rather than usefully diversifying it. So the rollout
-diversity (same task, new rollout) has to come from axes that are actually
-legitimate for a 3.x reasoning model:
+Rollout diversity comes from three axes:
+  1. temperature — Cerebras/Gemma-4-31B has no restriction on sampling params
+     (unlike Gemini 3.x), so varying temperature is a legitimate and effective
+     diversity knob. Low values produce more deterministic, focused rollouts;
+     high values produce more exploratory ones.
+  2. instruction_framing — light paraphrase of the *framing*, not task semantics.
+     Keeps the task distribution stable while varying the surface presentation.
+  3. inherent run-to-run nondeterminism — even at fixed temperature the model
+     is not fully deterministic, so repeated (task, temp, framing) tuples still
+     differ. Weak on its own; 1+2 carry the load.
 
-  1. thinking_level in {"low", "medium", "high"} -- this genuinely changes
-     trajectory character: low gives terse, fewer-turn rollouts; high gives
-     longer deliberation with more intermediate tool calls. This is your
-     single best controlled diversity knob now.
-  2. instruction_framing -- light paraphrase of *framing*, not task semantics.
-     Keep it minimal; Gemini 3.x responds best to direct instructions and can
-     over-analyze verbose prompt-engineering, so these stay short.
-  3. inherent run-to-run nondeterminism -- even at fixed config the model is
-     not fully deterministic, so repeated runs of the same (task, level,
-     framing) tuple still differ. This is weak on its own, which is why 1+2
-     carry the load.
-
-Target is still ~150K accepted new rows (100K -> 250K). With unlimited Gemini
-requests, cost is no longer the constraint, so you can afford a higher
-oversample and lean on Stage 5 to be strict. The constraint is now throughput
-(RPM/concurrency + sandbox capacity), handled in Stage 3.
+Target: ~150K accepted new rows (100K → 250K).
+OVERSAMPLE_FACTOR=1.5: calibrate from your Stage 5 pilot rejection rate and
+adjust before the full run.
 """
 import hashlib
 import random
@@ -32,16 +23,14 @@ import dask.dataframe as dd
 import pandas as pd
 
 TARGET_NEW_ROWS = 150_000
-OVERSAMPLE_FACTOR = 1.5  # higher than before -- requests are free now, be strict in Stage 5
+OVERSAMPLE_FACTOR = 1.5
 N_REQUESTS = int(TARGET_NEW_ROWS * OVERSAMPLE_FACTOR)
 
-THINKING_LEVELS = ["low", "medium", "high"]
-# Bias toward medium: docs note medium is the best quality/latency default for
-# most tasks; low/high give you the spread at the tails.
-THINKING_WEIGHTS = [0.25, 0.5, 0.25]
+TEMPERATURES = [0.7, 0.85, 1.0]
+TEMPERATURE_WEIGHTS = [0.3, 0.5, 0.2]   # bias toward 0.85 (quality/diversity sweet spot)
 
 INSTRUCTION_FRAMINGS = [
-    None,  # verbatim original instruction
+    None,   # verbatim original instruction
     "Solve this task step by step, verifying each command's effect before continuing.",
     "Approach this as you would in a real production terminal.",
 ]
@@ -66,7 +55,7 @@ def plan_variants(tasks_pdf: pd.DataFrame, n_requests: int, seed: int = 42) -> p
             rows.append({
                 "task_id": task_row[id_col],
                 "variant_id": stable_variant_id(str(task_row[id_col]), v),
-                "thinking_level": rng.choices(THINKING_LEVELS, weights=THINKING_WEIGHTS)[0],
+                "temperature": rng.choices(TEMPERATURES, weights=TEMPERATURE_WEIGHTS)[0],
                 "instruction_framing": rng.choice(INSTRUCTION_FRAMINGS),
             })
     plan = pd.DataFrame(rows)
@@ -79,4 +68,4 @@ if __name__ == "__main__":
     plan = plan_variants(tasks, N_REQUESTS)
     plan.to_parquet("/home/claude/pipeline/data/variant_plan.parquet", index=False)
     print(f"Planned {len(plan)} generation requests across {len(tasks)} tasks")
-    print(plan["thinking_level"].value_counts())
+    print(plan["temperature"].value_counts())

@@ -4,7 +4,7 @@
 
 This project is a research-focused synthetic data generation framework designed to augment the **OpenThoughts-Agent-SFT-100K** dataset into approximately **200,000–250,000 high-quality supervision traces** for post-training large language models. Rather than creating entirely new tasks, the framework preserves the original task distribution while generating diverse conversation trajectories for the same underlying tasks.
 
-The pipeline streams the dataset directly from Hugging Face using **Dask**, extracts task specifications from existing conversations, plans multiple augmentation strategies for each task, and uses **Gemma-4-31B Early Preview** served through **Cerebras Inference** to synthesize new multi-turn conversations with varied reasoning paths, conversation flow, clarification steps, and constraint handling.
+The pipeline streams the dataset directly from Hugging Face using **Dask**, extracts task specifications from existing conversations, plans multiple augmentation strategies for each task, and uses **Gemma-4-31B Early Preview** served through **Cerebras Inference** (`CEREBRAS_API_KEY`) to synthesize new multi-turn conversations with varied reasoning paths, conversation flow, clarification steps, and constraint handling.
 
 ## Architecture
 
@@ -28,8 +28,8 @@ Set `CEREBRAS_API_KEY` in your `.env` file before running any generation stage. 
 ## Augmentation strategy
 
 - **Same tasks, new rollouts** — task distribution is preserved; only trajectories are regenerated.
-- Diversity axes: `thinking_level` (low / medium / high) + instruction framing variants + inherent run-to-run nondeterminism.
-- Sampling parameters (temperature, top_p, top_k) are left at model defaults — tuning them degrades reasoning quality on this model family.
+- Diversity axes: temperature [0.7, 0.85, 1.0] + instruction framing variants + inherent run-to-run nondeterminism.
+- Temperature variation is the primary diversity knob (Gemma-4-31B on Cerebras has no restriction on sampling params).
 - Target: ~150K new accepted rows on top of the original 100K → ~250K total.
 - Oversample factor: 1.5× to account for Stage 5 rejection rate.
 

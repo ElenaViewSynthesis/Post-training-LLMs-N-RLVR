@@ -5,65 +5,52 @@
 Takes the 100K-trace SFT dataset, treats each row as a **task** (instruction +
 environment) decoupled from its **rollout** (the trajectory), and generates
 ~1.5x oversampled new rollouts for the same tasks via a real multi-turn agent
-loop on Gemini 3.5 Flash, with diversity from `thinking_level` + instruction
-framing. Validates, dedups, and merges back with the original 100K to land at
-250K total rows.
+loop using **Gemma-4-31B Early Preview** served through **Cerebras Inference**,
+with diversity from temperature variation + instruction framing. Validates,
+dedups, and merges back with the original 100K to land at 250K total rows.
 
 This is a "more rollouts of the same tasks" augmentation, not "new tasks" —
 deliberate, since you want to scale trace count without shifting the task
 distribution your model learns from.
 
-## Teacher: Gemini 3.5 Flash (unlimited requests)
+## Teacher: Gemma-4-31B via Cerebras Inference
 
-Because request volume is free for you, the pipeline runs the **real multi-turn
-sandboxed agent loop** rather than the single-shot *simulated* trajectories the
-earlier Anthropic-Batches design used to save cost. Real loop = actually-executed
-tool calls and observations, matching how the source dataset was generated.
+The pipeline uses **Gemma-4-31B Early Preview** served through the **Cerebras
+Inference API** (`cerebras-cloud-sdk`, OpenAI-compatible). Cerebras hardware
+delivers extremely high token throughput, making it well-suited for the
+volume of multi-turn rollouts needed here.
 
-Three Gemini-3.x-specific things baked into the design:
+Key design points:
 
-1. **No sampling-param perturbation.** Gemini 3.x is tuned for default
-   temperature/top_p/top_k and explicitly recommends against changing them;
-   doing so degrades reasoning. Rollout diversity instead comes from
-   `thinking_level` (low/medium/high) + light instruction framing + inherent
-   run-to-run nondeterminism. See Stage 2.
+1. **Temperature-based diversity.** Unlike Gemini 3.x, Gemma-4-31B on Cerebras
+   has no restriction on sampling parameters. Temperature is a legitimate and
+   effective diversity axis: low values (0.7) produce focused, deterministic
+   rollouts; high values (1.0) produce more exploratory ones. Stage 2 plans a
+   weighted distribution across [0.7, 0.85, 1.0]. See `plan_variants.py`.
 
-2. **Interactions API, not generateContent.** GA as of June 2026 and built for
-   agent loops: `previous_interaction_id` keeps conversation state server-side
-   (you don't resend history each turn), and `steps` gives you the full
-   observable timeline to capture as your trajectory. Needs
-   `google-genai >= 2.3.0`. The legacy `google-generativeai` package is
-   deprecated — don't use it.
+2. **Manual conversation history.** Cerebras has no server-side conversation
+   state, so the full message history is rebuilt and sent on every turn. At
+   Cerebras throughput speeds this is not a bottleneck — the ceiling is sandbox
+   I/O and RPM limits, not token generation.
 
-3. **Two execution backends** (choose in `03_gemini_agent_worker.py`):
-   - `antigravity` — the managed Antigravity agent runs Bash/Python/Node in a
-     Google-hosted sandbox. Zero container orchestration on your side. Best for
-     the generic-Ubuntu / nl2bash-style tasks; weaker where a task depends on a
-     specific Dockerfile you can't reproduce in Google's sandbox. Preview.
-   - `custom_sandbox` — you spin each task's real Docker env, expose
-     `run_bash`/`edit_file`/`run_tests` as function-calling tools, run the
-     pytest verifier at the end. Most faithful (reproduces the original
-     Terminus-2 method exactly); you own the sandbox lifecycle.
+3. **Function calling via OpenAI-compatible tools API.** `run_bash` and
+   `edit_file` are defined as standard function-calling tools. The model issues
+   tool calls, receives observations, and continues until completion or
+   `MAX_TURNS` is reached. Wire `execute_tool()` in `gemini_agent_worker.py`
+   to your real Docker sandbox.
 
-**"Unlimited requests" is not unlimited throughput.** Your real ceiling is now
-RPM/concurrency and — for `custom_sandbox` — how many containers you can run at
-once. `CONCURRENCY` in the worker is the tuning knob; start low, watch for 429s,
-ramp gradually (Gemini penalizes sharp traffic spikes like most APIs).
-
-A storage note specific to Gemini: interactions are **stored server-side by
-default** (paid tier retains ~55 days). That's convenient for `previous_interaction_id`,
-but if your task instructions are sensitive, set `store=false` — though that
-disables `previous_interaction_id` and `background=true`, so you'd lose the
-multi-turn state mechanism. For this open dataset it's a non-issue.
+**Throughput ceiling is `CONCURRENCY` + your sandbox capacity**, not token
+generation speed. Start at 32 concurrent workers, watch for 429s, ramp up.
+Set `CEREBRAS_API_KEY` in your `.env` (see `.env.example`).
 
 ## Pipeline stages
 
 | Stage | File | Runs on | Notes |
 |---|---|---|---|
 | 0-1 | `01_extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
-| 2 | `02_plan_variants.py` | pandas | builds the diversity plan via `thinking_level` + framing (NOT sampling params) |
-| 3 | `03_gemini_agent_worker.py` | async API | real multi-turn agent loop on Gemini 3.5 Flash; streams trajectories as they finish |
-| 4 | `04_OBSOLETE_*` | — | obsolete on the Gemini path (no batch to poll); worker is itself resume-safe |
+| 2 | `02_plan_variants.py` | pandas | builds the diversity plan via temperature + framing |
+| 3 | `gemini_agent_worker.py` | async API | real multi-turn agent loop via Cerebras Inference + Gemma-4-31B; streams trajectories as they finish |
+| 4 | `poll_n_fetch.py` | — | obsolete on the Cerebras path (no batch to poll); worker is itself resume-safe |
 | 5 | `05_validate_and_dedup.py` | dask | parse/structural checks, near-dup filter, (optional) verifier replay |
 | 6 | `06_merge_and_write.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to S3 |
 
@@ -75,31 +62,24 @@ all batches retrieved.
 Run stages 2-5 on a 500-1,000 task sample before committing the full 150K
 request budget. You need this to calibrate:
 - **Rejection rate** out of Stage 5 → tunes `OVERSAMPLE_FACTOR` in stage 2.
-- **Degenerate-output rate** (model refusing to "pretend" to have a
-  terminal) → tunes the regex filter or, better, swap to the true
-  multi-turn approach noted in `03_submit_batches.py` if refusals are common
-  for your task types.
-- **Cost** — at Sonnet 4.6 batch pricing (50% off standard), ~200K requests
-  with a few thousand input/output tokens each is a meaningful but
-  budgetable spend; get the actual number from a pilot rather than
-  estimating from list price alone, since real trajectories vary a lot in
-  length.
+- **Degenerate-output rate** (model refusing to act as a terminal agent) →
+  tunes the regex filter in `validate_n_dedup.py`.
+- **Optimal temperature** — calibrate which temperature setting in [0.7, 0.85, 1.0]
+  gives the best Stage 5 acceptance rate and tighten the weights in `plan_variants.py`
+  before the full run.
 
 ## Why the real agent loop (and not a batch / simulated approach)
 
-The earlier design used the Anthropic Batches API with single-shot *simulated*
-trajectories purely to capture the 50% batch discount. Unlimited Gemini
-requests removes that constraint, so the pipeline now runs the real loop. A
-batch API (Anthropic's or Gemini's) fundamentally can't run a multi-turn tool
-loop — each batched request is one self-contained call with no environment in
-between — so batch always implies simulated trajectories. With cost off the
-table, there's no reason to accept that fidelity hit.
+A batch API fundamentally can't run a multi-turn tool loop — each batched
+request is one self-contained call with no environment in between — so batch
+always implies simulated trajectories. The Cerebras async worker runs the real
+loop: actually-executed tool calls and observations, matching how the source
+dataset was generated via the Terminus-2 harness.
 
-If you later want a self-hosted teacher instead (you run vLLM/SGLang infra),
-the loop in `03_gemini_agent_worker.py` ports cleanly: swap the Gemini client
-for an OpenAI-compatible vLLM endpoint and keep the same function-calling
-tool contract. Worth a $/trace and quality comparison if Gemini throughput
-becomes the bottleneck.
+If you later want a self-hosted teacher (vLLM/SGLang infra), the loop in
+`gemini_agent_worker.py` ports cleanly: the Cerebras client is already
+OpenAI-compatible, so swapping to a local vLLM endpoint requires changing
+only the `base_url` and `api_key`.
 
 ---
 
