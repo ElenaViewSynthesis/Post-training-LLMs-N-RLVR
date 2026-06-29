@@ -58,7 +58,16 @@ Stage 5 — Validation + dedup (schema, structural, near-dup, verifier replay)
 Stage 6 — Merge with original + write 250K parquet → S3
 ```
 
-**Revised to Cerebras path:** The design was subsequently updated to use **Gemma-4-31B Early Preview via Cerebras Inference** (`CEREBRAS_API_KEY`) instead of the Anthropic Batches API (single-shot simulated trajectories). The Cerebras async worker runs the real multi-turn agent loop. Temperature variation replaces `thinking_level` as the diversity axis (Gemma-4-31B has no restriction on sampling params). See `gemini_agent_worker.py`, `plan_variants.py`, and `README.md`.
+**Final architecture — Cerebras structured trajectory synthesis:** Cerebras
+provides a high-throughput inference endpoint, not an agent runtime with sandbox
+infrastructure. The pipeline therefore uses **structured trajectory synthesis**:
+Gemma-4-31B generates a complete synthetic `conversations` list in a single
+inference call per variant, conditioned on the original task. No live tool
+execution, no container orchestration. Quality is enforced post-generation via
+Stage 5 (schema validation, semantic similarity filtering, safety checks,
+diversity scoring). Temperature variation replaces `thinking_level` as the
+diversity axis. Objective: 100K → 200K by augmenting `conversations`.
+See `gemini_agent_worker.py`, `plan_variants.py`, and `README.md`.
 
 ---
 

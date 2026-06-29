@@ -22,8 +22,8 @@ import random
 import dask.dataframe as dd
 import pandas as pd
 
-TARGET_NEW_ROWS = 150_000
-OVERSAMPLE_FACTOR = 1.5
+TARGET_NEW_ROWS = 100_000   # 100K original + 100K new = 200K total
+OVERSAMPLE_FACTOR = 1.5     # generate 150K, accept ~100K after Stage 5 filtering
 N_REQUESTS = int(TARGET_NEW_ROWS * OVERSAMPLE_FACTOR)
 
 TEMPERATURES = [0.7, 0.85, 1.0]

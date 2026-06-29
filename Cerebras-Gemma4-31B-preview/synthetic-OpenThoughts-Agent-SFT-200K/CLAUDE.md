@@ -1,14 +1,28 @@
 # synthetic-OpenThoughts-Agent-SFT-200K
 
+## Objective
+
+Expand **OpenThoughts-Agent-SFT-100K → 200K** by augmenting the `conversations`
+column using **Gemma-4-31B Early Preview** on **Cerebras Inference**.
+
 ## Project overview
 
-This project is a research-focused synthetic data generation framework designed to augment the **OpenThoughts-Agent-SFT-100K** dataset into approximately **200,000–250,000 high-quality supervision traces** for post-training large language models. Rather than creating entirely new tasks, the framework preserves the original task distribution while generating diverse conversation trajectories for the same underlying tasks.
+This project is a research-focused synthetic data generation framework designed to augment the **OpenThoughts-Agent-SFT-100K** dataset to **200,000 high-quality supervision traces** for post-training large language models. Rather than creating entirely new tasks, the framework preserves the original task distribution while generating diverse synthetic conversation trajectories for the same underlying tasks.
 
-The pipeline streams the dataset directly from Hugging Face using **Dask**, extracts task specifications from existing conversations, plans multiple augmentation strategies for each task, and uses **Gemma-4-31B Early Preview** served through **Cerebras Inference** (`CEREBRAS_API_KEY`) to synthesize new multi-turn conversations with varied reasoning paths, conversation flow, clarification steps, and constraint handling.
+The pipeline streams the dataset directly from Hugging Face using **Dask**, extracts task specifications from existing conversations, plans multiple augmentation strategies per task, and uses **Gemma-4-31B Early Preview** served through **Cerebras Inference** (`CEREBRAS_API_KEY`) to synthesize complete new multi-turn conversations via **structured trajectory synthesis** — a single high-throughput inference call per variant that generates the full `conversations` list, without requiring live sandbox execution.
 
-## Architecture
+## Architecture: structured trajectory synthesis
 
-The system is a scalable and reproducible data engineering pipeline optimized for high-throughput inference. It consists of modular stages:
+Cerebras provides a high-throughput inference endpoint, not an agent runtime.
+The pipeline therefore uses **structured trajectory synthesis**: Gemma-4-31B
+generates complete synthetic conversations in a single inference call, conditioned
+on the original task. Quality is enforced through a post-generation validation
+pipeline — schema validation, semantic similarity filtering, safety checks, and
+diversity scoring — which is the appropriate approach for large-scale SFT
+augmentation. This is distinct from agent execution (live sandbox, real tool calls),
+which would be 10–100× slower and unnecessary for SFT signal.
+
+The system is a scalable and reproducible data engineering pipeline. It consists of modular stages:
 
 | Stage | File | Purpose |
 |---|---|---|

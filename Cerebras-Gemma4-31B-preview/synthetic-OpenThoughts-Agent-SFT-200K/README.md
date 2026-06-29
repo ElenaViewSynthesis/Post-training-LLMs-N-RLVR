@@ -1,45 +1,65 @@
-# OpenThoughts-Agent-SFT 100K → 250K augmentation pipeline
+# OpenThoughts-Agent-SFT 100K → 200K augmentation pipeline
+
+## Objective
+
+Expand **OpenThoughts-Agent-SFT-100K** to **200K traces** by augmenting the
+`conversations` column using **Gemma-4-31B Early Preview** on **Cerebras
+Inference**. The task distribution is preserved — the same 100K tasks get new
+synthetic conversation trajectories, not new tasks.
 
 ## What this does
 
 Takes the 100K-trace SFT dataset, treats each row as a **task** (instruction +
-environment) decoupled from its **rollout** (the trajectory), and generates
-~1.5x oversampled new rollouts for the same tasks via a real multi-turn agent
-loop using **Gemma-4-31B Early Preview** served through **Cerebras Inference**,
-with diversity from temperature variation + instruction framing. Validates,
-dedups, and merges back with the original 100K to land at 250K total rows.
+environment) decoupled from its **conversations** (the trajectory), generates
+~1.5× oversampled new synthetic conversations for the same tasks, validates and
+dedups, then merges back with the original 100K to land at 200K total rows.
 
-This is a "more rollouts of the same tasks" augmentation, not "new tasks" —
-deliberate, since you want to scale trace count without shifting the task
-distribution your model learns from.
+## Architecture: structured trajectory synthesis, not agent execution
+
+The original dataset was built with a live agent runtime (Terminus-2 harness):
+a model executed real bash commands in a sandboxed environment. This pipeline
+uses a different and more scalable approach — **structured trajectory synthesis**:
+
+> Gemma-4-31B generates a complete synthetic conversation in a single inference
+> call, conditioned on the original task and augmentation strategy. The model
+> produces all turns — reasoning, tool calls, observations, and the final answer —
+> without any live sandbox environment.
+
+**Why this is correct for large-scale SFT augmentation:**
+- Agent execution requires container orchestration and is 10–100× slower per sample.
+- Trajectory synthesis runs at Cerebras throughput speeds, making 100K+ new samples practical.
+- For SFT, the student model learns from the conversation pattern — well-structured
+  synthetic trajectories are sufficient signal.
+- Quality is enforced post-generation by the validation pipeline (Stage 5): schema
+  validation, semantic similarity filtering, safety checks, and diversity scoring.
+
+This demonstrates the distinction between **agent execution** (live environment,
+real tool calls) and **trajectory generation** (structured synthesis conditioned
+on task context) — the latter being the appropriate choice here.
 
 ## Teacher: Gemma-4-31B via Cerebras Inference
 
-The pipeline uses **Gemma-4-31B Early Preview** served through the **Cerebras
-Inference API** (`cerebras-cloud-sdk`, OpenAI-compatible). Cerebras hardware
-delivers extremely high token throughput, making it well-suited for the
-volume of multi-turn rollouts needed here.
+The pipeline uses **Gemma-4-31B Early Preview** via the **Cerebras Inference
+API** (`cerebras-cloud-sdk`, OpenAI-compatible). Cerebras hardware delivers
+extremely high token throughput, making it well-suited for synthesizing large
+volumes of multi-turn conversations.
 
 Key design points:
 
-1. **Temperature-based diversity.** Unlike Gemini 3.x, Gemma-4-31B on Cerebras
-   has no restriction on sampling parameters. Temperature is a legitimate and
-   effective diversity axis: low values (0.7) produce focused, deterministic
-   rollouts; high values (1.0) produce more exploratory ones. Stage 2 plans a
-   weighted distribution across [0.7, 0.85, 1.0]. See `plan_variants.py`.
+1. **Single inference call per variant.** One request generates a complete
+   `conversations` list (all turns) as structured JSON. No multi-turn loop,
+   no sandbox — just high-throughput structured generation.
 
-2. **Manual conversation history.** Cerebras has no server-side conversation
-   state, so the full message history is rebuilt and sent on every turn. At
-   Cerebras throughput speeds this is not a bottleneck — the ceiling is sandbox
-   I/O and RPM limits, not token generation.
+2. **Temperature-based diversity.** Gemma-4-31B on Cerebras has no restriction
+   on sampling parameters. Temperature varies across [0.7, 0.85, 1.0] with a
+   weighted distribution biased toward 0.85. See `plan_variants.py`.
 
-3. **Function calling via OpenAI-compatible tools API.** `run_bash` and
-   `edit_file` are defined as standard function-calling tools. The model issues
-   tool calls, receives observations, and continues until completion or
-   `MAX_TURNS` is reached. Wire `execute_tool()` in `gemini_agent_worker.py`
-   to your real Docker sandbox.
+3. **Engineered synthesis prompt.** The system prompt instructs the model to
+   produce realistic step-by-step reasoning before tool calls, plausible bash
+   command sequences, realistic observations, and a conclusive final answer —
+   matching the style of the original dataset.
 
-**Throughput ceiling is `CONCURRENCY` + your sandbox capacity**, not token
+**Throughput ceiling is `CONCURRENCY` + Cerebras RPM limits**, not token
 generation speed. Start at 32 concurrent workers, watch for 429s, ramp up.
 Set `CEREBRAS_API_KEY` in your `.env` (see `.env.example`).
 
@@ -64,9 +84,11 @@ request budget. You need this to calibrate:
 - **Rejection rate** out of Stage 5 → tunes `OVERSAMPLE_FACTOR` in stage 2.
 - **Degenerate-output rate** (model refusing to act as a terminal agent) →
   tunes the regex filter in `validate_n_dedup.py`.
-- **Optimal temperature** — calibrate which temperature setting in [0.7, 0.85, 1.0]
-  gives the best Stage 5 acceptance rate and tighten the weights in `plan_variants.py`
-  before the full run.
+- **Optimal temperature** — calibrate which temperature in [0.7, 0.85, 1.0] gives
+  the best Stage 5 acceptance rate and tighten the weights in `plan_variants.py` before the full run.
+- **Synthesis prompt quality** — inspect a sample of generated `conversations` from the pilot
+  to verify the model is producing realistic tool-call/observation sequences, not hallucinated
+  or refusal outputs.
 
 ## Why the real agent loop (and not a batch / simulated approach)
 

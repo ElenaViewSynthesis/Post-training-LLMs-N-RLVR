@@ -1,21 +1,40 @@
 """
-Stage 3: Async multi-turn agent-loop worker — Cerebras Inference + Gemma-4-31B.
+Stage 3: Structured trajectory synthesis — Cerebras Inference + Gemma-4-31B.
 
-Uses the Cerebras Inference API (OpenAI-compatible) to drive Gemma-4-31B as
-the teacher model. Each variant gets a real multi-turn conversation: the model
-issues tool calls (run_bash, edit_file), receives observations, and continues
-until it declares completion or MAX_TURNS is reached.
+ARCHITECTURE NOTE — trajectory synthesis, not agent execution:
 
-Because Cerebras has no server-side conversation state, the full message
-history is rebuilt and sent on every turn. At Cerebras throughput speeds this
-is fine — the bottleneck is sandbox I/O, not token generation.
+The original OpenThoughts-Agent-SFT-100K dataset was built with a live agent
+runtime (Terminus-2 harness): a model actually executed bash commands in a
+real sandboxed environment and the tool call/observation turns were captured.
 
-Diversity comes from temperature + instruction framing (Stage 2), NOT
-thinking_level (that was Gemini-specific and does not apply here).
+This pipeline does NOT replicate that. Cerebras provides a high-throughput
+inference endpoint, not an agent runtime with sandbox infrastructure. Instead,
+this stage uses structured trajectory synthesis:
 
-CONCURRENCY is the primary throughput knob. Cerebras can sustain very high
-token/sec rates — your real ceiling is sandbox container capacity (BACKEND B)
-or RPM limits. Start at 32, watch for 429s, ramp up.
+    Gemma-4-31B generates a complete synthetic conversation in a single
+    inference call, conditioned on the original task and augmentation strategy.
+    The model produces all turns — reasoning, tool calls, observations, and
+    the final answer — without any live environment.
+
+Why this is the right approach for SFT augmentation at this scale:
+- Agent execution requires container orchestration, sandbox lifecycle
+  management, and is 10–100× slower per sample.
+- Trajectory synthesis runs at Cerebras throughput speeds (high tok/sec),
+  making 100K+ new samples practical.
+- Quality is enforced post-generation via the validation pipeline (Stage 5):
+  schema validation, semantic similarity filtering, safety checks, and
+  diversity scoring catch low-quality outputs rather than relying on live
+  execution to guarantee correctness.
+- For SFT, the model learns from the conversation pattern — realistic,
+  well-structured synthetic trajectories are sufficient signal.
+
+The synthesis prompt is engineered to produce trajectories that match the
+style and structure of the original dataset: step-by-step reasoning before
+each tool call, plausible bash command sequences, realistic observations,
+and a conclusive final answer.
+
+Objective: expand OpenThoughts-Agent-SFT-100K → 200K by augmenting the
+`conversations` column. This worker generates the new synthetic conversations.
 
 Requires: pip install cerebras-cloud-sdk
 """
@@ -31,136 +50,85 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MODEL = os.getenv("CEREBRAS_MODEL_ID", "cerebras/Gemma4-31B-preview")
-BACKEND = "custom_sandbox"      # or "stub" for local testing without containers
-CONCURRENCY = 32                # ramp up gradually; watch for 429s
-MAX_TURNS = 20
+CONCURRENCY = 32        # Cerebras throughput is high; ceiling is RPM limit, not tok/sec
+MAX_COMPLETION_TOKENS = 4096
 OUT_DIR = Path("/home/claude/pipeline/data/raw_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 client = AsyncCerebras(api_key=os.environ["CEREBRAS_API_KEY"])
 
-SYSTEM_PROMPT = (
-    "You are a terminal/software agent solving a task in a sandboxed Linux "
-    "environment. Use the provided tools to inspect and modify the system. "
-    "Issue one concrete tool call at a time and reason briefly before each. "
-    "Stop when the task is complete."
-)
+SYSTEM_PROMPT = """You are an expert software/terminal agent and dataset curator.
+Your task is to synthesize a realistic, high-quality agent trajectory for the given task.
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_bash",
-            "description": "Run a bash command in the task sandbox and return stdout/stderr/exit code.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The bash command to execute."}
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Overwrite a file at the given path with new contents.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "contents": {"type": "string"},
-                },
-                "required": ["path", "contents"],
-            },
-        },
-    },
-]
+Output a JSON object with a single key "conversations" whose value is a list of turns.
+Each turn is an object with:
+  - "role": one of "system", "user", "assistant", "tool"
+  - "content": the text of that turn
+
+The trajectory must:
+1. Begin with a brief reasoning step before each tool call ("I'll start by...")
+2. Include realistic bash commands (run_bash) or file edits (edit_file) as tool calls
+3. Follow each tool call with a plausible observation result
+4. End with a clear summary confirming the task is complete
+5. Match the style of the OpenThoughts-Agent-SFT dataset: concise, technical, step-by-step
+
+Respond with ONLY the JSON object. No markdown fences, no commentary."""
 
 
-async def execute_tool(sandbox, name: str, args: dict) -> str:
-    """Wire to your real per-task sandbox. Returns the tool observation string."""
-    if name == "run_bash":
-        return await sandbox.run_bash(args["command"])          # implement
-    if name == "edit_file":
-        return await sandbox.edit_file(args["path"], args["contents"])  # implement
-    return f"ERROR: unknown tool {name}"
-
-
-def build_user_message(task: dict, framing: str | None) -> str:
+def build_synthesis_prompt(task: dict, framing: str | None) -> str:
     instruction = task.get("instruction") or task.get("prompt") or task.get("task_description", "")
     env = task.get("environment") or task.get("dockerfile") or task.get("setup_script", "")
     text = instruction if not framing else f"{framing}\n\n{instruction}"
-    return f"## Task\n{text}\n\n## Environment\n{env or 'Generic Ubuntu container.'}"
+    return (
+        f"## Task\n{text}\n\n"
+        f"## Environment\n{env or 'Generic Ubuntu 22.04 container.'}\n\n"
+        "Synthesize a complete, realistic agent trajectory that solves this task."
+    )
 
 
-async def run_agent_loop(variant: dict, task: dict, sem: asyncio.Semaphore) -> dict:
+async def synthesize_trajectory(variant: dict, task: dict, sem: asyncio.Semaphore) -> dict:
     async with sem:
-        sandbox = None  # = await spin_up_sandbox(task)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_message(task, variant["instruction_framing"])},
-        ]
-        trajectory = []
         try:
-            for _ in range(MAX_TURNS):
-                response = await client.chat.completions.create(
-                    model=MODEL,
-                    messages=messages,
-                    tools=TOOLS,
-                    temperature=variant["temperature"],
-                    max_completion_tokens=1024,
-                )
-                msg = response.choices[0].message
-                messages.append({"role": "assistant", "content": msg.content, "tool_calls": msg.tool_calls})
-
-                tool_calls = msg.tool_calls or []
-                for tc in tool_calls:
-                    trajectory.append({
-                        "type": "function_call",
-                        "content": json.dumps({
-                            "name": tc.function.name,
-                            "arguments": json.loads(tc.function.arguments),
-                            "id": tc.id,
-                        }),
-                    })
-
-                if not tool_calls:
-                    # Model gave a final answer with no further tool call
-                    trajectory.append({"type": "text", "content": msg.content or ""})
-                    break
-
-                # Execute tools and feed observations back
-                for tc in tool_calls:
-                    args = json.loads(tc.function.arguments)
-                    obs = await execute_tool(sandbox, tc.function.name, args)
-                    trajectory.append({"type": "function_result", "content": obs})
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": obs,
-                    })
+            response = await client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": build_synthesis_prompt(
+                        task, variant["instruction_framing"]
+                    )},
+                ],
+                temperature=variant["temperature"],
+                max_completion_tokens=MAX_COMPLETION_TOKENS,
+            )
+            raw = response.choices[0].message.content or ""
+            # Attempt to parse the JSON trajectory
+            try:
+                parsed = json.loads(raw)
+                conversations = parsed.get("conversations")
+                if not isinstance(conversations, list):
+                    raise ValueError("missing or non-list 'conversations' key")
+                status = "ok"
+            except (json.JSONDecodeError, ValueError) as e:
+                conversations = None
+                status = f"parse_error:{e}"
 
             return {
                 "variant_id": variant["variant_id"],
                 "task_id": variant["task_id"],
-                "status": "ok",
-                "trajectory": trajectory,
-                "final_text": next(
-                    (t["content"] for t in reversed(trajectory) if t["type"] == "text"), None
-                ),
+                "temperature": variant["temperature"],
+                "status": status,
+                "conversations": conversations,
+                "raw": raw if status != "ok" else None,   # keep raw only on failure for debugging
             }
         except Exception as e:
             return {
                 "variant_id": variant["variant_id"],
                 "task_id": variant["task_id"],
+                "temperature": variant["temperature"],
                 "status": f"error:{type(e).__name__}",
-                "trajectory": trajectory,
-                "final_text": None,
+                "conversations": None,
+                "raw": None,
             }
-        finally:
-            pass  # await sandbox.teardown()
 
 
 async def main():
@@ -181,13 +149,15 @@ async def main():
     print(f"Resuming: {len(done)} already done, {len(plan) - len(done)} remaining")
 
     todo = [v for _, v in plan.iterrows() if v["variant_id"] not in done]
-    coros = [run_agent_loop(v, task_lookup[v["task_id"]], sem) for v in todo]
+    coros = [synthesize_trajectory(v, task_lookup[v["task_id"]], sem) for v in todo]
 
     with open(out_path, "a") as f:
         for fut in asyncio.as_completed(coros):
             rec = await fut
             f.write(json.dumps(rec) + "\n")
             f.flush()
+
+    print(f"Done. Results written to {out_path}")
 
 
 if __name__ == "__main__":
