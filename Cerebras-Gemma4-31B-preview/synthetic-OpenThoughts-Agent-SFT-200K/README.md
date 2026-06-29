@@ -78,9 +78,14 @@ cd cerebras-gemma4-31b-preview/synthetic-openthoughts-agent-sft-200k
 bash install.sh
 ```
 
-`install.sh` runs `python3 -m pip install -r requirements.txt`, enables
-`HF_HUB_ENABLE_HF_TRANSFER=1`, and creates the local pipeline data directories
-under `~/pipeline/data/`.
+`install.sh` creates a `.venv` virtual environment, installs all dependencies
+into it, enables `HF_HUB_ENABLE_HF_TRANSFER=1`, and creates the local pipeline
+data directories under `~/pipeline/data/`.
+
+**Activate the venv before every session:**
+```bash
+source .venv/bin/activate
+```
 
 ### 3. Configure credentials
 
