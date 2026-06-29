@@ -1,35 +1,36 @@
 """
 Stage 6: Merge original 100K rows with accepted new synthetic rows, reshape
 them into the original schema (preserving the `conversations` column structure),
-and push the final ~250K dataset to HuggingFace Hub.
+and sync the final ~250K dataset to HuggingFace Bucket via `hf sync`.
 
-Upload path: local sharded parquet → HuggingFace Hub via huggingface_hub.
-hf_transfer (C extension) is used for fast GCP EU CDN-backed uploads when
-HF_HUB_ENABLE_HF_TRANSFER=1 is set in your environment.
+Upload path:
+    local sharded parquet → hf sync → hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+
+Requires the `hf` CLI to be installed:
+    uv tool install hf
+
+Sync commands:
+    Upload:   hf sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+    Download: hf sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
 
 Objective: OpenThoughts-Agent-SFT-100K → 250K by augmenting `conversations`.
 """
 import os
-import shutil
-import tempfile
+import subprocess
 from pathlib import Path
 
 import dask.dataframe as dd
 import pandas as pd
 from dotenv import load_dotenv
-from huggingface_hub import HfApi, login
 
 load_dotenv()
 
-ORIGINAL_SRC = "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet"
+ORIGINAL_SRC  = "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet"
 VALIDATED_PATH = Path("~/pipeline/data/validated/validated_trajectories.parquet").expanduser()
-TASKS_PATH = Path("~/pipeline/data/tasks/").expanduser()
+TASKS_PATH     = Path("~/pipeline/data/tasks/").expanduser()
+UPLOAD_DIR     = Path("~/pipeline/data/upload").expanduser()
 
-# Target HuggingFace dataset repo — set in .env or override here
-HF_REPO_ID = os.environ.get("HF_DATASET_REPO_ID", "borntobeignored/OpenThoughts-Agents-SFT-250k")
-HF_TOKEN   = os.environ["HF_TOKEN"]
-
-# Shard size for parquet files written to HF Hub (100MB target per file)
+HF_BUCKET = "hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k"
 ROWS_PER_SHARD = 5_000
 
 
@@ -48,10 +49,6 @@ def reshape_to_original_schema(validated: pd.DataFrame, tasks: pd.DataFrame, ori
 
 
 def main():
-    # ── Authenticate ──────────────────────────────────────────────────────────
-    login(token=HF_TOKEN)
-    api = HfApi()
-
     # ── Load & merge ──────────────────────────────────────────────────────────
     original = dd.read_parquet(ORIGINAL_SRC)
     original_cols = list(original.columns)
@@ -72,40 +69,25 @@ def main():
     combined = dd.concat([original, new_ddf])
     print(f"Combined row count: {len(combined):,}")
 
-    # ── Write sharded parquet to a temp dir, then upload to HF Hub ────────────
-    tmp_dir = Path(tempfile.mkdtemp(prefix="hf_upload_"))
-    data_dir = tmp_dir / "data"
-    data_dir.mkdir()
-
-    print(f"Writing sharded parquet to {data_dir} ...")
+    # ── Write sharded parquet to upload dir ───────────────────────────────────
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Writing sharded parquet to {UPLOAD_DIR} ...")
     combined.to_parquet(
-        str(data_dir),
+        str(UPLOAD_DIR),
         write_index=False,
         engine="pyarrow",
         name_function=lambda i: f"train-{i:05d}-of-{combined.npartitions:05d}.parquet",
     )
 
-    # ── Create HF dataset repo if it doesn't exist ────────────────────────────
-    api.create_repo(
-        repo_id=HF_REPO_ID,
-        repo_type="dataset",
-        exist_ok=True,
-        private=False,
+    # ── Sync to HuggingFace Bucket via hf CLI ─────────────────────────────────
+    print(f"Syncing to {HF_BUCKET} ...")
+    subprocess.run(
+        ["hf", "sync", str(UPLOAD_DIR), HF_BUCKET],
+        check=True,
     )
 
-    # ── Upload — hf_transfer uses GCP EU CDN when HF_HUB_ENABLE_HF_TRANSFER=1 ─
-    print(f"Uploading to HuggingFace Hub: {HF_REPO_ID} ...")
-    api.upload_folder(
-        folder_path=str(data_dir),
-        repo_id=HF_REPO_ID,
-        repo_type="dataset",
-        path_in_repo="data",
-        token=HF_TOKEN,
-        commit_message="Add augmented 250K dataset (Gemma-4-31B synthetic conversations)",
-    )
-
-    shutil.rmtree(tmp_dir)
-    print(f"Done. Dataset live at: https://huggingface.co/datasets/{HF_REPO_ID}")
+    print(f"Done. Bucket: {HF_BUCKET}")
+    print(f"Download with: hf sync {HF_BUCKET} ./local")
 
 
 if __name__ == "__main__":

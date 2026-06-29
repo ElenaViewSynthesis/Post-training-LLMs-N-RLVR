@@ -146,50 +146,48 @@ only the `base_url` and `api_key`.
 
 ---
 
-## Output: HuggingFace Hub via GCP EU CDN
+## Output: HuggingFace Bucket via `hf sync` (GCP EU CDN)
 
-The final 250K dataset is pushed directly to a HuggingFace Hub dataset repo.
-`huggingface_hub` uploads through HuggingFace's GCP-backed infrastructure;
-with `HF_HUB_ENABLE_HF_TRANSFER=1` the C-extension `hf_transfer` bypasses
-Python overhead and uses the prewarmed GCP EU CDN for maximum upload throughput.
+The final 250K dataset is synced to a public HuggingFace Bucket using the
+`hf` CLI. `hf_transfer` (enabled by `HF_HUB_ENABLE_HF_TRANSFER=1`) uses
+HuggingFace's prewarmed GCP EU CDN for maximum throughput.
 
-### Setup
+**Bucket:** `hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k`
+
+### CLI commands
 
 ```bash
-# 1. Your HF token must have write access to the target repo
-#    Add to .env:
-HF_TOKEN=hf_your_read_write_token
-HF_DATASET_REPO_ID=your-username/OpenThoughts-Agent-SFT-250K
-HF_HUB_ENABLE_HF_TRANSFER=1   # already set by install.sh
+# Install hf CLI (done automatically by install.sh)
+uv tool install hf
 
-# 2. CLI login (install.sh does this automatically from .env)
-huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+# Upload local parquet shards to bucket
+hf sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+
+# Download bucket to local folder
+hf sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
 ```
 
 ### What Stage 6 does
 
 1. Merges original 100K rows + ~150K validated synthetic rows
-2. Writes sharded parquet files to a local temp directory
-3. Creates the Hub repo (private, skips if already exists)
-4. Uploads the `data/` folder via `api.upload_folder()` — chunked,
-   resumable, uses GCP EU CDN when `hf_transfer` is active
-5. Cleans up the temp directory
+2. Writes sharded parquet files to `~/pipeline/data/upload/`
+3. Runs `hf sync` to push all shards to the HF bucket
+4. Prints the download command on completion
 
 ### Local intermediate data layout
 
-Pipeline intermediates stay on local disk (not pushed to Hub):
-
 ```
 ~/pipeline/data/
-  tasks/                     # Stage 1 — task table (parquet)
-  variant_plan.parquet        # Stage 2 — 225K variant plan
+  tasks/                              # Stage 1 — task table (parquet)
+  variant_plan.parquet                # Stage 2 — 225K variant plan
   raw_results/
-    trajectories.jsonl        # Stage 3 — raw synthetic conversations
+    trajectories.jsonl                # Stage 3 — raw synthetic conversations
   validated/
-    validated_trajectories.parquet   # Stage 5 — filtered ~150K rows
+    validated_trajectories.parquet    # Stage 5 — filtered ~150K rows
+  upload/                             # Stage 6 — sharded parquet, ready to sync
 ```
 
 ### Token permissions
 
-Use a HuggingFace token with **write** scope (not read-only). Generate one at
-`huggingface.co/settings/tokens`. The repo is created as **public**.
+HF token must have **write** access to the `borntobeignored` org bucket.
+Generate one at `huggingface.co/settings/tokens`.
