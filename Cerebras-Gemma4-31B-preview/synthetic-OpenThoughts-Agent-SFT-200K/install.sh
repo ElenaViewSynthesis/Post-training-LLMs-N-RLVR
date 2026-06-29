@@ -37,14 +37,8 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 grep -qxF "HF_HUB_ENABLE_HF_TRANSFER=1" .env 2>/dev/null || echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> .env
 
 echo ""
-echo "=== Logging into HuggingFace CLI ==="
-if grep -q "^HF_TOKEN=" .env 2>/dev/null; then
-    HF_TOKEN_VAL=$(grep "^HF_TOKEN=" .env | cut -d= -f2)
-    huggingface-cli login --token "$HF_TOKEN_VAL" --add-to-git-credential
-else
-    huggingface-cli login --add-to-git-credential
-fi
-
+echo "=== HuggingFace auth ==="
+echo "    If not already logged in, run: hf auth login"
 echo ""
 echo "=== Creating local pipeline directories ==="
 mkdir -p "$HOME/pipeline/data/tasks"
