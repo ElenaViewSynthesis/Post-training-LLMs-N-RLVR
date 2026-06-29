@@ -26,7 +26,7 @@ VALIDATED_PATH = Path("~/pipeline/data/validated/validated_trajectories.parquet"
 TASKS_PATH = Path("~/pipeline/data/tasks/").expanduser()
 
 # Target HuggingFace dataset repo — set in .env or override here
-HF_REPO_ID = os.environ["HF_DATASET_REPO_ID"]   # e.g. "your-username/OpenThoughts-Agent-SFT-250K"
+HF_REPO_ID = os.environ.get("HF_DATASET_REPO_ID", "borntobeignored/OpenThoughts-Agents-SFT-250k")
 HF_TOKEN   = os.environ["HF_TOKEN"]
 
 # Shard size for parquet files written to HF Hub (100MB target per file)
