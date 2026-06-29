@@ -52,7 +52,7 @@ load_dotenv()
 MODEL = os.getenv("CEREBRAS_MODEL_ID", "cerebras/Gemma4-31B-preview")
 CONCURRENCY = 32        # Cerebras throughput is high; ceiling is RPM limit, not tok/sec
 MAX_COMPLETION_TOKENS = 4096
-OUT_DIR = Path("/home/claude/pipeline/data/raw_results")
+OUT_DIR = Path("~/pipeline/data/raw_results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 client = AsyncCerebras(api_key=os.environ["CEREBRAS_API_KEY"])
@@ -132,8 +132,8 @@ async def synthesize_trajectory(variant: dict, task: dict, sem: asyncio.Semaphor
 
 
 async def main():
-    plan = pd.read_parquet("/home/claude/pipeline/data/variant_plan.parquet")
-    tasks = pd.read_parquet("/home/claude/pipeline/data/tasks/")
+    plan = pd.read_parquet("~/pipeline/data/variant_plan.parquet")
+    tasks = pd.read_parquet("~/pipeline/data/tasks/")
     id_col = "task_id" if "task_id" in tasks.columns else "id"
     task_lookup = {row[id_col]: row.to_dict() for _, row in tasks.iterrows()}
 

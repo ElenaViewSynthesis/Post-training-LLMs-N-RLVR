@@ -72,5 +72,5 @@ if __name__ == "__main__":
     task_cols, traj_cols = split_task_and_trajectory(df)
 
     tasks = build_task_table(df, task_cols)
-    tasks.to_parquet("/home/claude/pipeline/data/tasks/", write_index=False)
-    print(f"Wrote task table -> /home/claude/pipeline/data/tasks/")
+    tasks.to_parquet("~/pipeline/data/tasks/", write_index=False)
+    print(f"Wrote task table -> ~/pipeline/data/tasks/")

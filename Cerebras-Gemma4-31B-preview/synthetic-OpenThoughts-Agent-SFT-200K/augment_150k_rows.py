@@ -11,8 +11,8 @@ import dask.dataframe as dd
 import pandas as pd
 
 ORIGINAL_SRC = "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet"
-VALIDATED_PATH = Path("/home/claude/pipeline/data/validated/validated_trajectories.parquet")
-TASKS_PATH = Path("/home/claude/pipeline/data/tasks/")
+VALIDATED_PATH = Path("~/pipeline/data/validated/validated_trajectories.parquet")
+TASKS_PATH = Path("~/pipeline/data/tasks/")
 
 # Set this to your bucket; see README for IAM / storage-class recommendations.
 S3_OUT = "s3://your-bucket/openthoughts-agent-sft-250k/"

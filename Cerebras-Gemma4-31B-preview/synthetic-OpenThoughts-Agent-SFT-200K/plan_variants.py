@@ -64,8 +64,8 @@ def plan_variants(tasks_pdf: pd.DataFrame, n_requests: int, seed: int = 42) -> p
 
 
 if __name__ == "__main__":
-    tasks = dd.read_parquet("/home/claude/pipeline/data/tasks/").compute()
+    tasks = dd.read_parquet("~/pipeline/data/tasks/").compute()
     plan = plan_variants(tasks, N_REQUESTS)
-    plan.to_parquet("/home/claude/pipeline/data/variant_plan.parquet", index=False)
+    plan.to_parquet("~/pipeline/data/variant_plan.parquet", index=False)
     print(f"Planned {len(plan)} generation requests across {len(tasks)} tasks")
     print(plan["temperature"].value_counts())

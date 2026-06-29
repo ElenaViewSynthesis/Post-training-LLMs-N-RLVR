@@ -34,8 +34,8 @@ import dask.dataframe as dd
 import dask.bag as db
 import pandas as pd
 
-RAW_RESULTS_DIR = Path("/home/claude/pipeline/data/raw_results")
-OUT_PATH = Path("/home/claude/pipeline/data/validated")
+RAW_RESULTS_DIR = Path("~/pipeline/data/raw_results")
+OUT_PATH = Path("~/pipeline/data/validated")
 
 DEGENERATE_PATTERNS = [
     r"i (don't|do not) have access to (a|an) (real|actual) (environment|terminal|shell)",
