@@ -1,0 +1,7 @@
+.env
+*.env
+checkpoints/
+__pycache__/
+*.pyc
+.venv/
+wandb/

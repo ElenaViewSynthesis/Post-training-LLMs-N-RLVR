@@ -1,0 +1,17 @@
+[project]
+name = "cerebras-gemma4-31b-preview"
+version = "0.1.0"
+description = "Post-training pipeline for Cerebras Gemma4-31B-preview via SFT, GRPO and RLVR"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=0.34.0",
+    "bitsandbytes>=0.43.0",
+    "cerebras-cloud-sdk>=1.0.0",
+    "datasets>=3.0.0",
+    "peft>=0.13.0",
+    "python-dotenv>=1.2.2",
+    "torch>=2.3.0",
+    "transformers>=4.50.0",
+    "trl>=0.12.0",
+    "wandb>=0.27.2",
+]
