@@ -1,0 +1,69 @@
+"""
+Stage 6: Merge original 100K rows with accepted new rows, reshape new rows
+into the original schema, and write the final ~250K dataset out to S3 as
+partitioned parquet.
+"""
+from pathlib import Path
+
+import dask.dataframe as dd
+import pandas as pd
+
+ORIGINAL_SRC = "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet"
+VALIDATED_PATH = Path("/home/claude/pipeline/data/validated/validated_trajectories.parquet")
+TASKS_PATH = Path("/home/claude/pipeline/data/tasks/")
+
+# Set this to your bucket; see README for IAM / storage-class recommendations.
+S3_OUT = "s3://your-bucket/openthoughts-agent-sft-250k/"
+STORAGE_OPTIONS = {
+    # boto3 picks up credentials from env / instance role automatically;
+    # only set these explicitly if you need to override (e.g. cross-account).
+    # "key": "...", "secret": "...",
+}
+
+
+def reshape_to_original_schema(validated: pd.DataFrame, tasks: pd.DataFrame, original_cols: list) -> pd.DataFrame:
+    task_lookup = tasks.set_index("task_id")
+    rows = []
+    for _, rec in validated.iterrows():
+        task = task_lookup.loc[rec["task_id"]]
+        row = {col: task.get(col) for col in original_cols if col in task.index}
+        row["trajectory"] = rec["trajectory"]  # adjust key name to match your trajectory column
+        row["id"] = rec["variant_id"]
+        row["is_synthetic_augmentation"] = True
+        row["source_task_id"] = rec["task_id"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def main():
+    original = dd.read_parquet(ORIGINAL_SRC)
+    original_cols = list(original.columns)
+
+    validated = pd.read_parquet(VALIDATED_PATH)
+    tasks = pd.read_parquet(TASKS_PATH)
+
+    new_rows = reshape_to_original_schema(validated, tasks, original_cols)
+    new_ddf = dd.from_pandas(new_rows, npartitions=max(1, len(new_rows) // 5000))
+
+    # Align columns (new rows may be missing some original-only columns —
+    # fill with None rather than dropping, to keep a stable schema for training)
+    for col in original_cols:
+        if col not in new_ddf.columns:
+            new_ddf[col] = None
+    new_ddf = new_ddf[original.columns.tolist() + ["is_synthetic_augmentation", "source_task_id"]]
+    original = original.assign(is_synthetic_augmentation=False, source_task_id=None)
+
+    combined = dd.concat([original, new_ddf])
+    print(f"Final combined row count (lazy, triggering compute): {len(combined)}")
+
+    combined.to_parquet(
+        S3_OUT,
+        write_index=False,
+        storage_options=STORAGE_OPTIONS,
+        engine="pyarrow",
+    )
+    print(f"Wrote combined dataset -> {S3_OUT}")
+
+
+if __name__ == "__main__":
+    main()
