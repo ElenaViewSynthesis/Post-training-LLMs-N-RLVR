@@ -47,7 +47,7 @@ def plan_variants(tasks_pdf: pd.DataFrame, n_requests: int, seed: int = 42) -> p
     base_per_task = n_requests // n_tasks
     remainder = n_requests % n_tasks
 
-    id_col = "task_id" if "task_id" in tasks_pdf.columns else "id"
+    id_col = next((c for c in ("task_id", "id", "task", "run_id") if c in tasks_pdf.columns), tasks_pdf.columns[0])
     rows = []
     for i, (_, task_row) in enumerate(tasks_pdf.iterrows()):
         k = base_per_task + (1 if i < remainder else 0)
@@ -64,8 +64,12 @@ def plan_variants(tasks_pdf: pd.DataFrame, n_requests: int, seed: int = 42) -> p
 
 
 if __name__ == "__main__":
-    tasks = dd.read_parquet("~/pipeline/data/tasks/").compute()
+    from pathlib import Path
+    TASKS_PATH = str(Path("~/pipeline/data/tasks/").expanduser())
+    PLAN_PATH  = str(Path("~/pipeline/data/variant_plan.parquet").expanduser())
+
+    tasks = dd.read_parquet(TASKS_PATH).compute()
     plan = plan_variants(tasks, N_REQUESTS)
-    plan.to_parquet("~/pipeline/data/variant_plan.parquet", index=False)
+    plan.to_parquet(PLAN_PATH, index=False)
     print(f"Planned {len(plan)} generation requests across {len(tasks)} tasks")
     print(plan["temperature"].value_counts())
