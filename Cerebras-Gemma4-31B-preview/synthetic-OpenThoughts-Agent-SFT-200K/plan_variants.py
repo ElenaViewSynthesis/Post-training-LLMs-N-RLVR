@@ -12,9 +12,9 @@ Rollout diversity comes from three axes:
      is not fully deterministic, so repeated (task, temp, framing) tuples still
      differ. Weak on its own; 1+2 carry the load.
 
-Target: ~150K accepted new rows (100K → 250K).
-OVERSAMPLE_FACTOR=1.5: calibrate from your Stage 5 pilot rejection rate and
-adjust before the full run.
+Target: ~150K accepted new rows (100K original + 150K new = 250K total).
+OVERSAMPLE_FACTOR=1.5 → generates 225K requests; calibrate from your Stage 5
+pilot rejection rate and adjust before the full run.
 """
 import hashlib
 import random
@@ -22,8 +22,8 @@ import random
 import dask.dataframe as dd
 import pandas as pd
 
-TARGET_NEW_ROWS = 100_000   # 100K original + 100K new = 200K total
-OVERSAMPLE_FACTOR = 1.5     # generate 150K, accept ~100K after Stage 5 filtering
+TARGET_NEW_ROWS = 150_000   # 100K original + 150K new = 250K total
+OVERSAMPLE_FACTOR = 1.5     # generate 225K, accept ~150K after Stage 5 filtering
 N_REQUESTS = int(TARGET_NEW_ROWS * OVERSAMPLE_FACTOR)
 
 TEMPERATURES = [0.7, 0.85, 1.0]
