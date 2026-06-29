@@ -14,3 +14,4 @@ cerebras-cloud-sdk>=1.0.0
 
 # Utilities
 python-dotenv>=1.2.2
+tqdm>=4.66.0

@@ -46,6 +46,7 @@ from pathlib import Path
 import pandas as pd
 from cerebras.cloud.sdk import AsyncCerebras
 from dotenv import load_dotenv
+from tqdm.asyncio import tqdm as atqdm
 
 load_dotenv()
 
@@ -151,13 +152,20 @@ async def main():
     todo = [v for _, v in plan.iterrows() if v["variant_id"] not in done]
     coros = [synthesize_trajectory(v, task_lookup[v["task_id"]], sem) for v in todo]
 
+    ok = err = 0
     with open(out_path, "a") as f:
-        for fut in asyncio.as_completed(coros):
+        pbar = atqdm(asyncio.as_completed(coros), total=len(coros), unit="req")
+        async for fut in pbar:
             rec = await fut
+            if rec["status"] == "ok":
+                ok += 1
+            else:
+                err += 1
+            pbar.set_postfix(ok=ok, err=err, err_rate=f"{err/(ok+err+1e-9):.1%}")
             f.write(json.dumps(rec) + "\n")
             f.flush()
 
-    print(f"Done. Results written to {out_path}")
+    print(f"Done. ok={ok} err={err}  Results written to {out_path}")
 
 
 if __name__ == "__main__":
