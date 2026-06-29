@@ -146,74 +146,51 @@ only the `base_url` and `api_key`.
 
 ---
 
-## S3 storage recommendations
+## Output: HuggingFace Hub via GCP EU CDN
 
-For a dataset of this size and access pattern (write once per pipeline run,
-read repeatedly by dask/training jobs, occasional reprocessing), here's what
-I'd actually set up:
+The final 250K dataset is pushed directly to a HuggingFace Hub dataset repo.
+`huggingface_hub` uploads through HuggingFace's GCP-backed infrastructure;
+with `HF_HUB_ENABLE_HF_TRANSFER=1` the C-extension `hf_transfer` bypasses
+Python overhead and uses the prewarmed GCP EU CDN for maximum upload throughput.
 
-### Bucket structure
+### Setup
+
+```bash
+# 1. Your HF token must have write access to the target repo
+#    Add to .env:
+HF_TOKEN=hf_your_read_write_token
+HF_DATASET_REPO_ID=your-username/OpenThoughts-Agent-SFT-250K
+HF_HUB_ENABLE_HF_TRANSFER=1   # already set by install.sh
+
+# 2. CLI login (install.sh does this automatically from .env)
+huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
 ```
-s3://your-org-sft-data/
-  openthoughts-agent-sft-100k-raw/        # immutable copy of the original, pinned
-  openthoughts-agent-sft-pipeline/
-    tasks/                                 # Stage 1 output
-    variant_plan/                          # Stage 2 output
-    raw_results/                           # Stage 4 output (batch JSONL)
-    validated/                             # Stage 5 output
-  openthoughts-agent-sft-250k/             # Stage 6 final output, what training actually reads
+
+### What Stage 6 does
+
+1. Merges original 100K rows + ~150K validated synthetic rows
+2. Writes sharded parquet files to a local temp directory
+3. Creates the Hub repo (private, skips if already exists)
+4. Uploads the `data/` folder via `api.upload_folder()` — chunked,
+   resumable, uses GCP EU CDN when `hf_transfer` is active
+5. Cleans up the temp directory
+
+### Local intermediate data layout
+
+Pipeline intermediates stay on local disk (not pushed to Hub):
+
+```
+~/pipeline/data/
+  tasks/                     # Stage 1 — task table (parquet)
+  variant_plan.parquet        # Stage 2 — 225K variant plan
+  raw_results/
+    trajectories.jsonl        # Stage 3 — raw synthetic conversations
+  validated/
+    validated_trajectories.parquet   # Stage 5 — filtered ~150K rows
 ```
 
-Keep the **raw 100K pinned in your own bucket** rather than re-pulling from
-`hf://` every run — HF repo content can update upstream, and you want your
-250K to be reproducible against a fixed base. `aws s3 sync` or a single
-`dd.read_parquet(...).to_parquet("s3://...")` once, then point everything
-downstream at your own copy.
+### Token permissions
 
-### Storage class
-- **Intermediate stages** (`tasks/`, `variant_plan/`, `raw_results/`,
-  `validated/`): **S3 Standard**. These get read/written repeatedly during
-  pipeline iteration and re-runs; don't fight lifecycle transitions while
-  you're still tuning Stage 5's rejection thresholds.
-- **Final `250k/` dataset**: S3 Standard while actively training against
-  it; transition to **S3 Standard-IA** via a lifecycle rule once a training
-  run is checkpointed and stable, since you'll read it in full occasionally
-  but not continuously.
-- Skip Glacier tiers for anything in the active pipeline — retrieval latency
-  will stall a dask job that hits a cold object.
-
-### Performance for dask + parquet specifically
-- **Partition file count matters more than bucket settings.** Aim for
-  parquet files in the 100-500MB range per partition — too many small files
-  (default dask chunking from a pandas-heavy stage can produce thousands of
-  tiny files) tanks S3 list/get throughput. Use `repartition(partition_size="200MB")`
-  before the final `to_parquet` in Stage 6 if your partition count looks
-  too high after the merge.
-- Use `s3fs` (dask's default S3 backend) with `anon=False` and let it pick up
-  credentials from environment/instance role — avoid hardcoding keys in
-  `storage_options`.
-- Set `AWS_REQUEST_CHECKSUM_CALCULATION=when_required` and
-  `AWS_RESPONSE_CHECKSUM_VALIDATION=when_required` env vars if you're on a
-  recent boto3/s3fs version and see unexpected latency — newer SDK defaults
-  added checksums that cost throughput on highly parallel small-object
-  workloads; this is a known footgun with dask+s3fs at scale.
-- If your dask workers and S3 bucket aren't in the same AWS region, fix that
-  first — cross-region S3 reads are the single biggest avoidable latency
-  cost in pipelines like this.
-
-### Access / IAM
-- Scope a dedicated IAM role/policy to exactly these prefixes
-  (`openthoughts-agent-sft-*`) rather than reusing a broad data-lake role —
-  this is throwaway/regenerable training data, not something that needs
-  org-wide read access by default.
-- If multiple people on the team will re-run stages, consider S3 Object
-  Lock or simple versioning on the `250k/` final prefix only, so a bad
-  Stage 6 re-run doesn't silently overwrite the dataset a training job is
-  mid-read on.
-
-### Cost note
-At this scale (100K→250K rows of agentic traces, likely tens of GB total),
-S3 storage cost is negligible next to the Batches API generation cost —
-don't over-engineer the storage tier; get Stage 5's validation right first,
-since that's what determines whether you actually have a useful 250K
-dataset versus 250K rows of mediocre trajectories.
+Use a HuggingFace token with **write** scope (not read-only). Generate one at
+`huggingface.co/settings/tokens`. The repo is created private by default —
+make it public from the Hub UI once you've verified the dataset quality.

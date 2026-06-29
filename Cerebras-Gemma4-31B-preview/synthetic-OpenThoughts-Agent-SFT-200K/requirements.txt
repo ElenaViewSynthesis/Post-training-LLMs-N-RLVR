@@ -4,16 +4,13 @@ pyarrow>=15.0.0
 pandas>=2.0.0
 fsspec>=2024.1.0
 
-# HuggingFace streaming (hf:// protocol + fast C-extension transfer)
+# HuggingFace — streaming (hf:// protocol), fast CDN upload, dataset push
 huggingface_hub>=0.23.0
 hf_transfer>=0.1.6
+datasets>=2.19.0
 
 # Cerebras Inference (teacher model)
 cerebras-cloud-sdk>=1.0.0
-
-# S3 output
-s3fs>=2024.1.0
-boto3>=1.34.0
 
 # Utilities
 python-dotenv>=1.2.2
