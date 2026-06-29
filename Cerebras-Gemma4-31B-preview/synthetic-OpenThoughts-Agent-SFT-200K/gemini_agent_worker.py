@@ -48,7 +48,7 @@ from cerebras.cloud.sdk import AsyncCerebras
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm as atqdm
 
-load_dotenv()
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 MODEL = os.getenv("CEREBRAS_MODEL_ID", "cerebras/Gemma4-31B-preview")
 CONCURRENCY = 32        # Cerebras throughput is high; ceiling is RPM limit, not tok/sec
