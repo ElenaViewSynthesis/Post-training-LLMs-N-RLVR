@@ -63,6 +63,42 @@ Key design points:
 generation speed. Start at 32 concurrent workers, watch for 429s, ramp up.
 Set `CEREBRAS_API_KEY` in your `.env` (see `.env.example`).
 
+## Setup
+
+### 1. Install pip (WSL / Ubuntu — if not already present)
+
+```bash
+sudo apt update && sudo apt install -y python3-pip
+```
+
+### 2. Install pipeline dependencies
+
+```bash
+cd cerebras-gemma4-31b-preview/synthetic-openthoughts-agent-sft-200k
+bash install.sh
+```
+
+`install.sh` runs `python3 -m pip install -r requirements.txt`, enables
+`HF_HUB_ENABLE_HF_TRANSFER=1`, and creates the local pipeline data directories
+under `~/pipeline/data/`.
+
+### 3. Configure credentials
+
+Copy `.env.example` to `.env` and fill in your keys:
+
+```bash
+cp .env.example .env
+```
+
+```
+CEREBRAS_API_KEY=your_cerebras_api_key_here
+HF_TOKEN=your_huggingface_read_token_here
+HF_HUB_ENABLE_HF_TRANSFER=1
+CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
+```
+
+---
+
 ## Pipeline stages
 
 | Stage | File | Runs on | Notes |
