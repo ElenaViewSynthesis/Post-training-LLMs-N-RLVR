@@ -134,7 +134,7 @@ async def synthesize_trajectory(variant: dict, task: dict, sem: asyncio.Semaphor
 async def main():
     plan  = pd.read_parquet(Path("~/pipeline/data/variant_plan.parquet").expanduser())
     tasks = pd.read_parquet(Path("~/pipeline/data/tasks/").expanduser())
-    id_col = "task_id" if "task_id" in tasks.columns else "id"
+    id_col = next((c for c in ("task_id", "id", "task", "run_id") if c in tasks.columns), tasks.columns[0])
     task_lookup = {row[id_col]: row.to_dict() for _, row in tasks.iterrows()}
 
     sem = asyncio.Semaphore(CONCURRENCY)
