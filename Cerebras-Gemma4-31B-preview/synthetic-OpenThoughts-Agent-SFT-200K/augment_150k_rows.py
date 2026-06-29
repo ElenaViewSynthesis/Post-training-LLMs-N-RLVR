@@ -90,7 +90,7 @@ def main():
         repo_id=HF_REPO_ID,
         repo_type="dataset",
         exist_ok=True,
-        private=True,
+        private=False,
     )
 
     # ── Upload — hf_transfer uses GCP EU CDN when HF_HUB_ENABLE_HF_TRANSFER=1 ─

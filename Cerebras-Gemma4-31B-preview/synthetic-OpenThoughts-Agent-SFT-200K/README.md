@@ -192,5 +192,4 @@ Pipeline intermediates stay on local disk (not pushed to Hub):
 ### Token permissions
 
 Use a HuggingFace token with **write** scope (not read-only). Generate one at
-`huggingface.co/settings/tokens`. The repo is created private by default —
-make it public from the Hub UI once you've verified the dataset quality.
+`huggingface.co/settings/tokens`. The repo is created as **public**.
