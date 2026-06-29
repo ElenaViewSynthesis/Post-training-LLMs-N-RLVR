@@ -46,25 +46,23 @@ DEGENERATE_RE = re.compile("|".join(DEGENERATE_PATTERNS), re.IGNORECASE)
 
 
 def parse_result_line(line: str) -> dict | None:
-    """Parse one line of the Gemini worker's trajectories.jsonl.
-    Each record is already structured: {variant_id, task_id, status,
-    trajectory: [{type, content}, ...], final_text}. No nested JSON-in-text to
-    re-decode (unlike the old Anthropic single-shot path), because the worker
-    captured real step objects turn by turn."""
+    """Parse one line of trajectories.jsonl written by gemini_agent_worker.py.
+    Each record: {variant_id, task_id, temperature, status,
+    conversations: [{role, content}, ...], raw}."""
     rec = json.loads(line)
     if rec.get("status") != "ok":
         return {"variant_id": rec.get("variant_id"), "status": rec.get("status", "unknown"),
-                "trajectory": None}
+                "conversations": None}
     return {"variant_id": rec["variant_id"], "status": "parsed",
-            "trajectory": rec.get("trajectory")}
+            "conversations": rec.get("conversations")}
 
 
-def structural_check(trajectory: list | None) -> bool:
-    if not trajectory or not isinstance(trajectory, list):
+def structural_check(conversations: list | None) -> bool:
+    if not conversations or not isinstance(conversations, list):
         return False
-    if len(trajectory) < 2 or len(trajectory) > 40:
+    if len(conversations) < 2 or len(conversations) > 40:
         return False
-    full_text = " ".join(turn.get("content", "") for turn in trajectory if isinstance(turn, dict))
+    full_text = " ".join(turn.get("content", "") for turn in conversations if isinstance(turn, dict))
     if DEGENERATE_RE.search(full_text):
         return False
     if len(full_text.strip()) < 50:
@@ -72,12 +70,12 @@ def structural_check(trajectory: list | None) -> bool:
     return True
 
 
-def trajectory_fingerprint(trajectory: list) -> str:
+def conversations_fingerprint(conversations: list) -> str:
     """Cheap near-dup signal: hash of normalized content, ignoring whitespace
     and casing. For stronger dedup, swap this for an embedding-similarity
     pass (e.g. sentence-transformers + cosine threshold) — fine as a first
     pass given volume, but log your collision rate and upgrade if it's high."""
-    norm = " ".join(turn.get("content", "").strip().lower() for turn in trajectory if isinstance(turn, dict))
+    norm = " ".join(turn.get("content", "").strip().lower() for turn in conversations if isinstance(turn, dict))
     norm = re.sub(r"\s+", " ", norm)
     return hashlib.sha256(norm.encode()).hexdigest()
 
@@ -87,9 +85,9 @@ def process_partition(records: list[dict]) -> list[dict]:
     for rec in records:
         if rec["status"] != "parsed":
             continue
-        if not structural_check(rec["trajectory"]):
+        if not structural_check(rec["conversations"]):
             continue
-        rec["fingerprint"] = trajectory_fingerprint(rec["trajectory"])
+        rec["fingerprint"] = conversations_fingerprint(rec["conversations"])
         out.append(rec)
     return out
 
@@ -119,10 +117,10 @@ def main():
 
     OUT_PATH.mkdir(parents=True, exist_ok=True)
     df.to_parquet(OUT_PATH / "validated_trajectories.parquet", index=False)
-    print(f"Final validated count: {len(df)} (target 150,000 new rows)")
-    if len(df) < 150_000:
-        print("WARNING: under target. Either raise OVERSAMPLE_FACTOR in stage 2 "
-              "and submit a top-up batch, or loosen structural_check if it's overly strict.")
+    print(f"Final validated count: {len(df)} (target 100,000 new rows → 200K total)")
+    if len(df) < 100_000:
+        print("WARNING: under target. Either raise OVERSAMPLE_FACTOR in plan_variants.py "
+              "and re-run the worker, or loosen structural_check if it's overly strict.")
 
 
 if __name__ == "__main__":
