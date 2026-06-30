@@ -50,7 +50,7 @@ from tqdm.asyncio import tqdm as atqdm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-MODEL = os.getenv("CEREBRAS_MODEL_ID", "cerebras/Gemma4-31B-preview")
+MODEL = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")
 CONCURRENCY = 32        # Cerebras throughput is high; ceiling is RPM limit, not tok/sec
 MAX_COMPLETION_TOKENS = 4096
 OUT_DIR = Path("~/pipeline/data/raw_results").expanduser()
