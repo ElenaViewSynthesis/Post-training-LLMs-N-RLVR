@@ -51,7 +51,8 @@ from tqdm.asyncio import tqdm as atqdm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-MODEL = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")
+# MODEL = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")  # Gemma-4-31B (paid tier)
+MODEL = "zai-glm-4.7"                                    # free tier fallback
 CONCURRENCY = 4             # free tier: stay within RPM limits
 BATCH_SIZE = 60             # process plan in chunks of 60 variants
 MAX_RETRIES = 5             # retries on rate-limit errors
