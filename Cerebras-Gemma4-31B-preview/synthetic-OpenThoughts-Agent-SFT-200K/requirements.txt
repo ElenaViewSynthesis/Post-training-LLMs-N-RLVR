@@ -9,8 +9,12 @@ huggingface_hub>=0.23.0
 hf_transfer>=0.1.6
 datasets>=2.19.0
 
-# Cerebras Inference (teacher model)
+# Cerebras Inference (teacher model — fallback when SageMaker endpoint not set)
 cerebras-cloud-sdk>=1.0.0
+
+# SageMaker deployment + inference (deploy_sagemaker.py + gemma4_31b_agent.py)
+sagemaker<3.0.0
+boto3>=1.34.0
 
 # Utilities
 python-dotenv>=1.2.2
