@@ -108,12 +108,12 @@ CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
 
 | Stage | File | Runs on | Notes |
 |---|---|---|---|
-| 0-1 | `01_extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
-| 2 | `02_plan_variants.py` | pandas | builds the diversity plan via temperature + framing |
-| 3 | `gemma4_31b_agent.py` | async API | real multi-turn agent loop via Cerebras Inference + Gemma-4-31B; streams trajectories as they finish |
+| 0-1 | `extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
+| 2 | `plan_variants.py` | pandas | builds the diversity plan via temperature + framing |
+| 3 | `gemma4_31b_agent.py` | async API | structured trajectory synthesis via Cerebras Inference + Gemma-4-31B; streams results as they finish |
 | 4 | `poll_n_fetch.py` | — | obsolete on the Cerebras path (no batch to poll); worker is itself resume-safe |
-| 5 | `05_validate_and_dedup.py` | dask | parse/structural checks, near-dup filter, (optional) verifier replay |
-| 6 | `06_merge_and_write.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to S3 |
+| 5 | `validate_n_dedup.py` | dask | parse/structural checks, near-dup filter, (optional) verifier replay |
+| 6 | `augment_150k_rows.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to HF bucket |
 
 Run in order. Stage 4 is poll-and-resume safe — re-run it until it reports
 all batches retrieved.

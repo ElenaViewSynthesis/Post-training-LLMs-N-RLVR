@@ -13,7 +13,7 @@ Sync commands:
     Upload:   hf sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
     Download: hf sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
 
-Objective: OpenThoughts-Agent-SFT-100K → 250K by augmenting `conversations`.
+Objective: OpenThoughts-Agent-SFT-100K → 250K total (100K original + 150K synthetic) by augmenting `conversations`.
 """
 import os
 import subprocess
@@ -35,13 +35,15 @@ ROWS_PER_SHARD = 5_000
 
 
 def reshape_to_original_schema(validated: pd.DataFrame, tasks: pd.DataFrame, original_cols: list) -> pd.DataFrame:
-    task_lookup = tasks.set_index("task_id")
+    id_col = next((c for c in ("task_id", "id", "task", "run_id") if c in tasks.columns), tasks.columns[0])
+    task_lookup = {row[id_col]: row.to_dict() for _, row in tasks.iterrows()}
     rows = []
     for _, rec in validated.iterrows():
-        task = task_lookup.loc[rec["task_id"]]
-        row = {col: task.get(col) for col in original_cols if col in task.index}
+        task = task_lookup.get(rec["task_id"], {})
+        row = {col: task.get(col) for col in original_cols}
         row["conversations"] = rec["conversations"]  # synthetic conversations from Gemma-4-31B
-        row["id"] = rec["variant_id"]
+        row["run_id"] = rec["variant_id"]
+        row["trial_name"] = rec["variant_id"]
         row["is_synthetic_augmentation"] = True
         row["source_task_id"] = rec["task_id"]
         rows.append(row)

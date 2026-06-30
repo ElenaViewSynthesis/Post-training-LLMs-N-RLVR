@@ -45,11 +45,14 @@ DEGENERATE_PATTERNS = [
 DEGENERATE_RE = re.compile("|".join(DEGENERATE_PATTERNS), re.IGNORECASE)
 
 
-def parse_result_line(line: str) -> dict | None:
-    """Parse one line of trajectories.jsonl written by gemini_agent_worker.py.
+def parse_result_line(line: str) -> dict:
+    """Parse one line of trajectories.jsonl written by gemma4_31b_agent.py.
     Each record: {variant_id, task_id, temperature, status,
     conversations: [{role, content}, ...], raw}."""
-    rec = json.loads(line)
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return {"variant_id": None, "status": "json_error", "conversations": None}
     if rec.get("status") != "ok":
         return {"variant_id": rec.get("variant_id"), "status": rec.get("status", "unknown"),
                 "conversations": None}
@@ -117,8 +120,8 @@ def main():
 
     OUT_PATH.mkdir(parents=True, exist_ok=True)
     df.to_parquet(OUT_PATH / "validated_trajectories.parquet", index=False)
-    print(f"Final validated count: {len(df)} (target 100,000 new rows → 200K total)")
-    if len(df) < 100_000:
+    print(f"Final validated count: {len(df)} (target 150,000 new rows → 250K total)")
+    if len(df) < 150_000:
         print("WARNING: under target. Either raise OVERSAMPLE_FACTOR in plan_variants.py "
               "and re-run the worker, or loosen structural_check if it's overly strict.")
 
