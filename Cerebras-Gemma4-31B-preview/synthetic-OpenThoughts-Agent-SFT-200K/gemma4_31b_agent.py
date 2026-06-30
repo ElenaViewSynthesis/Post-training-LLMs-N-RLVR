@@ -160,7 +160,12 @@ async def main():
     if out_path.exists():
         with open(out_path) as f:
             for line in f:
-                done.add(json.loads(line)["variant_id"])
+                try:
+                    rec = json.loads(line)
+                    if rec.get("status") == "ok":
+                        done.add(rec["variant_id"])
+                except json.JSONDecodeError:
+                    pass
     print(f"Resuming: {len(done)} already done, {len(plan) - len(done)} remaining")
 
     todo = [v for _, v in plan.iterrows() if v["variant_id"] not in done]
