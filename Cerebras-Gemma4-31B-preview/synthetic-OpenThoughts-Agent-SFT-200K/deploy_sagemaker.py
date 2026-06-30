@@ -26,11 +26,7 @@ from sagemaker.huggingface import HuggingFaceModel, get_huggingface_llm_image_ur
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-try:
-    role = sagemaker.get_execution_role()
-except ValueError:
-    iam = boto3.client("iam")
-    role = iam.get_role(RoleName="sagemaker_execution_role")["Role"]["Arn"]
+role = "arn:aws:iam::149901539173:role/Gemma-4-31b-deploy"
 
 huggingface_model = HuggingFaceModel(
     image_uri=get_huggingface_llm_image_uri("huggingface", version="2.4.1"),
