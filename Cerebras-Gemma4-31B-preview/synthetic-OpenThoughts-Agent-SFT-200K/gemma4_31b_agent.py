@@ -33,8 +33,8 @@ style and structure of the original dataset: step-by-step reasoning before
 each tool call, plausible bash command sequences, realistic observations,
 and a conclusive final answer.
 
-Objective: expand OpenThoughts-Agent-SFT-100K → 200K by augmenting the
-`conversations` column. This worker generates the new synthetic conversations.
+Objective: expand OpenThoughts-Agent-SFT-100K → 250K total (100K original +
+150K synthetic) by augmenting the `conversations` column.
 
 Requires: pip install cerebras-cloud-sdk
 """
@@ -52,13 +52,16 @@ from tqdm.asyncio import tqdm as atqdm
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 MODEL = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")
-CONCURRENCY = 32        # Cerebras throughput is high; ceiling is RPM limit, not tok/sec
+CONCURRENCY = 4             # free tier: stay within RPM limits
+BATCH_SIZE = 60             # process plan in chunks of 60 variants
+MAX_RETRIES = 5             # retries on rate-limit errors
+RETRY_BACKOFF_BASE = 2      # seconds; wait doubles each retry (2, 4, 8, 16, 32)
 MAX_COMPLETION_TOKENS = 4096
 OUT_DIR = Path("~/pipeline/data/raw_results").expanduser()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 HF_BUCKET = "hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k/raw_results"
-SYNC_INTERVAL = 5_000   # push to HF bucket every N records
+SYNC_EVERY_N_BATCHES = 10   # sync to HF bucket every N batches (~600 records)
 
 
 def sync_to_hf():
@@ -69,6 +72,7 @@ def sync_to_hf():
         )
     except Exception as e:
         print(f"\n[hf sync warning] {e} — continuing without sync")
+
 
 client = AsyncCerebras(api_key=os.environ["CEREBRAS_API_KEY"])
 
@@ -103,47 +107,82 @@ def build_synthesis_prompt(task: dict, framing: str | None) -> str:
 
 async def synthesize_trajectory(variant: dict, task: dict, sem: asyncio.Semaphore) -> dict:
     async with sem:
-        try:
-            response = await client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": build_synthesis_prompt(
-                        task, variant["instruction_framing"]
-                    )},
-                ],
-                temperature=variant["temperature"],
-                max_completion_tokens=MAX_COMPLETION_TOKENS,
-            )
-            raw = response.choices[0].message.content or ""
-            # Attempt to parse the JSON trajectory
+        for attempt in range(MAX_RETRIES):
             try:
-                parsed = json.loads(raw)
-                conversations = parsed.get("conversations")
-                if not isinstance(conversations, list):
-                    raise ValueError("missing or non-list 'conversations' key")
-                status = "ok"
-            except (json.JSONDecodeError, ValueError) as e:
-                conversations = None
-                status = f"parse_error:{e}"
+                response = await client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": build_synthesis_prompt(
+                            task, variant["instruction_framing"]
+                        )},
+                    ],
+                    temperature=variant["temperature"],
+                    max_completion_tokens=MAX_COMPLETION_TOKENS,
+                )
+                raw = response.choices[0].message.content or ""
+                try:
+                    parsed = json.loads(raw)
+                    conversations = parsed.get("conversations")
+                    if not isinstance(conversations, list):
+                        raise ValueError("missing or non-list 'conversations' key")
+                    status = "ok"
+                except (json.JSONDecodeError, ValueError) as e:
+                    conversations = None
+                    status = f"parse_error:{e}"
 
-            return {
-                "variant_id": variant["variant_id"],
-                "task_id": variant["task_id"],
-                "temperature": variant["temperature"],
-                "status": status,
-                "conversations": conversations,
-                "raw": raw if status != "ok" else None,   # keep raw only on failure for debugging
-            }
-        except Exception as e:
-            return {
-                "variant_id": variant["variant_id"],
-                "task_id": variant["task_id"],
-                "temperature": variant["temperature"],
-                "status": f"error:{type(e).__name__}:{e}",
-                "conversations": None,
-                "raw": None,
-            }
+                return {
+                    "variant_id": variant["variant_id"],
+                    "task_id": variant["task_id"],
+                    "temperature": variant["temperature"],
+                    "status": status,
+                    "conversations": conversations,
+                    "raw": raw if status != "ok" else None,
+                }
+
+            except Exception as e:
+                err_str = str(e)
+                is_rate_limit = (
+                    "429" in err_str
+                    or "rate_limit" in err_str.lower()
+                    or "too many" in err_str.lower()
+                )
+                if is_rate_limit and attempt < MAX_RETRIES - 1:
+                    wait = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    await asyncio.sleep(wait)
+                    continue
+
+                return {
+                    "variant_id": variant["variant_id"],
+                    "task_id": variant["task_id"],
+                    "temperature": variant["temperature"],
+                    "status": f"error:{type(e).__name__}:{e}",
+                    "conversations": None,
+                    "raw": None,
+                }
+
+        return {
+            "variant_id": variant["variant_id"],
+            "task_id": variant["task_id"],
+            "temperature": variant["temperature"],
+            "status": "error:MaxRetriesExceeded",
+            "conversations": None,
+            "raw": None,
+        }
+
+
+async def run_batch(batch: list, task_lookup: dict, sem: asyncio.Semaphore, f) -> tuple[int, int]:
+    coros = [synthesize_trajectory(v, task_lookup.get(v["task_id"], {}), sem) for v in batch]
+    ok = err = 0
+    async for fut in atqdm(asyncio.as_completed(coros), total=len(coros), unit="req", leave=False):
+        rec = await fut
+        if rec["status"] == "ok":
+            ok += 1
+        else:
+            err += 1
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+    return ok, err
 
 
 async def main():
@@ -154,7 +193,6 @@ async def main():
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    # Resume-safe: skip variants already written
     out_path = OUT_DIR / "trajectories.jsonl"
     done = set()
     if out_path.exists():
@@ -166,29 +204,29 @@ async def main():
                         done.add(rec["variant_id"])
                 except json.JSONDecodeError:
                     pass
-    print(f"Resuming: {len(done)} already done, {len(plan) - len(done)} remaining")
 
     todo = [v for _, v in plan.iterrows() if v["variant_id"] not in done]
-    coros = [synthesize_trajectory(v, task_lookup[v["task_id"]], sem) for v in todo]
+    total_batches = (len(todo) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"Resuming: {len(done)} already done, {len(todo)} remaining "
+          f"({total_batches} batches of {BATCH_SIZE})")
 
-    ok = err = total = 0
+    total_ok = total_err = 0
     with open(out_path, "a") as f:
-        pbar = atqdm(asyncio.as_completed(coros), total=len(coros), unit="req")
-        async for fut in pbar:
-            rec = await fut
-            if rec["status"] == "ok":
-                ok += 1
-            else:
-                err += 1
-            total += 1
-            pbar.set_postfix(ok=ok, err=err, err_rate=f"{err/(ok+err+1e-9):.1%}")
-            f.write(json.dumps(rec) + "\n")
-            f.flush()
-            if total % SYNC_INTERVAL == 0:
-                pbar.write(f"[{total}] syncing to HF bucket...")
+        for batch_num, start in enumerate(range(0, len(todo), BATCH_SIZE), 1):
+            batch = todo[start:start + BATCH_SIZE]
+            print(f"\nBatch {batch_num}/{total_batches} ({len(batch)} variants)...")
+            ok, err = await run_batch(batch, task_lookup, sem, f)
+            total_ok += ok
+            total_err += err
+            processed = total_ok + total_err
+            print(f"  ok={ok} err={err} | total: ok={total_ok} err={total_err} "
+                  f"err_rate={total_err / max(processed, 1):.1%}")
+
+            if batch_num % SYNC_EVERY_N_BATCHES == 0:
+                print(f"[batch {batch_num}] syncing to HF bucket...")
                 sync_to_hf()
 
-    print(f"Done. ok={ok} err={err}  Results written to {out_path}")
+    print(f"\nDone. ok={total_ok} err={total_err}  Results -> {out_path}")
     print("Final sync to HF bucket...")
     sync_to_hf()
 
