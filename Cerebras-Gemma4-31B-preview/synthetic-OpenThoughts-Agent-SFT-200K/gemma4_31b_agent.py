@@ -140,7 +140,7 @@ async def synthesize_trajectory(variant: dict, task: dict, sem: asyncio.Semaphor
                 "variant_id": variant["variant_id"],
                 "task_id": variant["task_id"],
                 "temperature": variant["temperature"],
-                "status": f"error:{type(e).__name__}",
+                "status": f"error:{type(e).__name__}:{e}",
                 "conversations": None,
                 "raw": None,
             }
