@@ -32,9 +32,9 @@ huggingface_model = HuggingFaceModel(
     image_uri=get_huggingface_llm_image_uri("huggingface", version="2.4.1"),
     env={
         "HF_MODEL_ID":       "google/gemma-4-31b-it",
-        "SM_NUM_GPUS":       "4",
-        "MAX_INPUT_LENGTH":  "4096",
-        "MAX_TOTAL_TOKENS":  "8192",
+        "SM_NUM_GPUS":       "8",           # 8x H100 80GB = 640GB VRAM
+        "MAX_INPUT_LENGTH":  "32768",
+        "MAX_TOTAL_TOKENS":  "65536",
         "HF_TOKEN":          os.environ.get("HF_TOKEN", ""),
     },
     role=role,
@@ -42,7 +42,7 @@ huggingface_model = HuggingFaceModel(
 
 predictor = huggingface_model.deploy(
     initial_instance_count=1,
-    instance_type="ml.g6.12xlarge",
+    instance_type="ml.p5.48xlarge",        # 8x H100 SXM 80GB
     endpoint_name="gemma-4-31b-sft-pipeline",
 )
 
