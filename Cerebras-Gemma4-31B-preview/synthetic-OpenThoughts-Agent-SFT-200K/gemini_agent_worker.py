@@ -41,6 +41,7 @@ Requires: pip install cerebras-cloud-sdk
 import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -55,6 +56,19 @@ CONCURRENCY = 32        # Cerebras throughput is high; ceiling is RPM limit, not
 MAX_COMPLETION_TOKENS = 4096
 OUT_DIR = Path("~/pipeline/data/raw_results").expanduser()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+HF_BUCKET = "hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k/raw_results"
+SYNC_INTERVAL = 5_000   # push to HF bucket every N records
+
+
+def sync_to_hf():
+    try:
+        subprocess.run(
+            ["hf", "sync", str(OUT_DIR), HF_BUCKET],
+            check=True, capture_output=True,
+        )
+    except Exception as e:
+        print(f"\n[hf sync warning] {e} — continuing without sync")
 
 client = AsyncCerebras(api_key=os.environ["CEREBRAS_API_KEY"])
 
@@ -152,7 +166,7 @@ async def main():
     todo = [v for _, v in plan.iterrows() if v["variant_id"] not in done]
     coros = [synthesize_trajectory(v, task_lookup[v["task_id"]], sem) for v in todo]
 
-    ok = err = 0
+    ok = err = total = 0
     with open(out_path, "a") as f:
         pbar = atqdm(asyncio.as_completed(coros), total=len(coros), unit="req")
         async for fut in pbar:
@@ -161,11 +175,17 @@ async def main():
                 ok += 1
             else:
                 err += 1
+            total += 1
             pbar.set_postfix(ok=ok, err=err, err_rate=f"{err/(ok+err+1e-9):.1%}")
             f.write(json.dumps(rec) + "\n")
             f.flush()
+            if total % SYNC_INTERVAL == 0:
+                pbar.write(f"[{total}] syncing to HF bucket...")
+                sync_to_hf()
 
     print(f"Done. ok={ok} err={err}  Results written to {out_path}")
+    print("Final sync to HF bucket...")
+    sync_to_hf()
 
 
 if __name__ == "__main__":
