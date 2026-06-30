@@ -28,7 +28,7 @@ The system is a scalable and reproducible data engineering pipeline. It consists
 |---|---|---|
 | 0-1 | `extract_tasks.py` | Dataset ingestion, schema inspection, task extraction |
 | 2 | `plan_variants.py` | Augmentation planning per task |
-| 3 | `gemini_agent_worker.py` | Async generation via Cerebras Inference |
+| 3 | `gemma4_31b_agent.py` | Async generation via Cerebras Inference |
 | 4 | `poll_n_fetch.py` | Obsolete on the Gemini path; kept as marker |
 | 5 | `validate_n_dedup.py` | Validation, dedup, quality filtering |
 | 6 | `augment_150k_rows.py` | Merge with original 100K, export to Parquet |

@@ -110,7 +110,7 @@ CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
 |---|---|---|---|
 | 0-1 | `01_extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
 | 2 | `02_plan_variants.py` | pandas | builds the diversity plan via temperature + framing |
-| 3 | `gemini_agent_worker.py` | async API | real multi-turn agent loop via Cerebras Inference + Gemma-4-31B; streams trajectories as they finish |
+| 3 | `gemma4_31b_agent.py` | async API | real multi-turn agent loop via Cerebras Inference + Gemma-4-31B; streams trajectories as they finish |
 | 4 | `poll_n_fetch.py` | — | obsolete on the Cerebras path (no batch to poll); worker is itself resume-safe |
 | 5 | `05_validate_and_dedup.py` | dask | parse/structural checks, near-dup filter, (optional) verifier replay |
 | 6 | `06_merge_and_write.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to S3 |
@@ -140,7 +140,7 @@ loop: actually-executed tool calls and observations, matching how the source
 dataset was generated via the Terminus-2 harness.
 
 If you later want a self-hosted teacher (vLLM/SGLang infra), the loop in
-`gemini_agent_worker.py` ports cleanly: the Cerebras client is already
+`gemma4_31b_agent.py` ports cleanly: the Cerebras client is already
 OpenAI-compatible, so swapping to a local vLLM endpoint requires changing
 only the `base_url` and `api_key`.
 

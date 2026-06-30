@@ -67,7 +67,7 @@ execution, no container orchestration. Quality is enforced post-generation via
 Stage 5 (schema validation, semantic similarity filtering, safety checks,
 diversity scoring). Temperature variation replaces `thinking_level` as the
 diversity axis. Objective: 100K → 200K by augmenting `conversations`.
-See `gemini_agent_worker.py`, `plan_variants.py`, and `README.md`.
+See `gemma4_31b_agent.py`, `plan_variants.py`, and `README.md`.
 
 ---
 
@@ -90,7 +90,7 @@ See `gemini_agent_worker.py`, `plan_variants.py`, and `README.md`.
 |---|---|---|---|
 | 0–1 | `extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
 | 2 | `plan_variants.py` | pandas | diversity via `thinking_level` + framing (not sampling params) |
-| 3 | `gemini_agent_worker.py` | async API | real multi-turn agent loop on Gemini 3.5 Flash; streams trajectories as they finish |
+| 3 | `gemma4_31b_agent.py` | async API | real multi-turn agent loop on Gemini 3.5 Flash; streams trajectories as they finish |
 | 4 | `poll_n_fetch.py` | — | obsolete on the Gemini path; worker is itself resume-safe |
 | 5 | `validate_n_dedup.py` | dask | parse/structural checks, near-dup filter, optional verifier replay |
 | 6 | `augment_150k_rows.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to S3 |
@@ -101,6 +101,6 @@ See `gemini_agent_worker.py`, `plan_variants.py`, and `README.md`.
 
 - [ ] Run `extract_tasks.py` standalone first and read the printed schema — column lists are introspected at runtime but confirm the task/trajectory split looks correct.
 - [ ] Run a pilot on 500–1,000 tasks through stages 2–5 to calibrate the Stage 5 rejection rate and tune `OVERSAMPLE_FACTOR` accordingly.
-- [ ] Confirm `CONCURRENCY` in `gemini_agent_worker.py` against your actual RPM ceiling — start conservative and ramp up.
+- [ ] Confirm `CONCURRENCY` in `gemma4_31b_agent.py` against your actual RPM ceiling — start conservative and ramp up.
 - [ ] Verify your S3 bucket and dask workers are in the same AWS region.
 - [ ] Set `CEREBRAS_API_KEY` and `GEMINI_API_KEY` in `.env` (see `.env.example`).
