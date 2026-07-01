@@ -26,7 +26,7 @@ payload = {
         "max_new_tokens": 512,
         "temperature": 0.7,
         "enable_reasoning": True,
-        "reasoning_depth": 3,
+        "reasoning_depth": 6,
     },
 }
 

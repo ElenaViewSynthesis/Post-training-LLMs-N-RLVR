@@ -124,7 +124,7 @@ reasoning_payload = {
         "max_new_tokens": 1024,
         "temperature": 0.7,
         "enable_reasoning": True,   # Gemma 4 specific feature
-        "reasoning_depth": 3,
+        "reasoning_depth": 6,
     },
 }
 
