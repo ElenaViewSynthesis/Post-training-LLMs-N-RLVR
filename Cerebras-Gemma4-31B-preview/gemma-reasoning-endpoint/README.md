@@ -1,6 +1,33 @@
 # Gemma-4-31B Reasoning Endpoint
 
-Deploys `google/gemma-4-31b-it` as a SageMaker TGI inference endpoint on `ml.p4d.24xlarge` (8× A100 40GB = 320GB VRAM) with reasoning mode enabled.
+Deploys `google/gemma-4-31b-it` as a SageMaker TGI inference endpoint with reasoning mode enabled.
+
+## Endpoint Instance — `ml.p4d.24xlarge`
+
+| Property | Value |
+|---|---|
+| GPUs | 8× NVIDIA A100 SXM4 40GB |
+| Total GPU VRAM | 320GB (8 × 40GB) |
+| GPU interconnect | NVLink 600 GB/s |
+| vCPUs | 96 |
+| System RAM | 1,152 GB |
+| Local NVMe storage | 8 TB |
+| Network bandwidth | 400 Gbps |
+| Cost (us-east-1) | **~$32.77/hr** |
+| Billing | Per second, billed per minute |
+
+**Why this instance for Gemma-4-31B:**
+Gemma-4-31B is 62GB in FP16. Sharded across 8 GPUs via TGI tensor parallelism, each A100 holds ~7.75GB of weights — leaving ~32GB per GPU free for KV cache, enabling long context at `MAX_TOTAL_TOKENS=65536`. All 8 GPUs are active with `SM_NUM_GPUS=8`, none sit idle.
+
+**Cost estimate for a 1-hour session:**
+```
+Deploy + load model : ~25 min  →  ~$13.65
+Testing             : ~35 min  →  ~$19.12
+─────────────────────────────────────────
+Total (1 hr)        :           ~$32.77
+```
+
+Delete the endpoint immediately after testing — idle instances cost the same as active ones.
 
 ---
 
