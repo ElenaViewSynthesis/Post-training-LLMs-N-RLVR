@@ -2,7 +2,7 @@
 One-time deployment: Gemma-4-31B-it to a SageMaker TGI endpoint.
 
 Infrastructure:
-  Compute  — ml.p5.48xlarge (8x H100 SXM 80GB), using 4 GPUs via TGI tensor parallelism
+  Compute  — ml.p4d.24xlarge (8x A100 40GB = 320GB VRAM), all 8 GPUs active via TGI tensor parallelism
   Storage  — 256 GB EBS volume on the instance (holds 62GB model weights + overhead)
   Artifacts— S3: s3://<sagemaker-default-bucket>/gemma-4-31b/
 
@@ -45,7 +45,7 @@ huggingface_model = HuggingFaceModel(
     image_uri=get_huggingface_llm_image_uri("huggingface", version="2.4.1"),
     env={
         "HF_MODEL_ID":      "google/gemma-4-31b-it",
-        "SM_NUM_GPUS":      "4",            # 4x H100 80GB = 320GB VRAM for 62GB model
+        "SM_NUM_GPUS":      "8",            # 8x A100 40GB = 320GB VRAM, all GPUs active
         "MAX_INPUT_LENGTH": "32768",
         "MAX_TOTAL_TOKENS": "65536",
         "HF_TOKEN":         os.environ.get("HF_TOKEN", ""),
@@ -62,7 +62,7 @@ huggingface_model = HuggingFaceModel(
 print("\nDeploying endpoint (this takes 15–30 minutes for a 31B model)...")
 predictor = huggingface_model.deploy(
     initial_instance_count=1,
-    instance_type="ml.p5.48xlarge",
+    instance_type="ml.p4d.24xlarge",
     endpoint_name="gemma-4-31b-sft-pipeline",
     volume_size=256,                                    # GB EBS — model is 62GB
     model_data_download_timeout=3600,                  # 1 hr to download from HF

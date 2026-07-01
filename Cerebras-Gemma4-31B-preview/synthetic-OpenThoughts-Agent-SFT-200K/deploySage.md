@@ -1,5 +1,14 @@
 # SageMaker Deployment Notes — Gemma-4-31B
 
+## Instance
+
+**`ml.p4d.24xlarge`** — 8× A100 40GB = 320GB total VRAM, all 8 GPUs active via TGI 8-way tensor parallelism.
+Gemma-4-31B is 62GB in FP16 → ~7.75GB per GPU for weights, leaving ~32GB per GPU for KV cache.
+
+Previously `ml.p5.48xlarge` with `SM_NUM_GPUS=4` — only 4 of 8 H100s were used, leaving 4 GPUs idle.
+
+---
+
 ## What was added to `deploy_sagemaker.py`
 
 **Addition:** `volume_size=256` GB EBS
@@ -13,7 +22,7 @@
 ---
 
 **Addition:** `container_startup_health_check_timeout=3600`
-**Why:** TGI needs time to shard the model across 4 GPUs after download
+**Why:** TGI needs time to shard the model across 8 GPUs after download
 
 ---
 
@@ -24,10 +33,10 @@
 
 ## Before running the deploy script
 
-You still need the `ml.p5.48xlarge` quota (currently 0 by default).
+You need the `ml.p4d.24xlarge` quota (may be 0 by default in your account).
 
 1. Go to **AWS Service Quotas → SageMaker**
-2. Search `L-BC4DA661`
+2. Search for `ml.p4d.24xlarge` endpoint quota
 3. Click **Request increase to 1**
 
 Once approved, run:
