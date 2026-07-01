@@ -1,5 +1,5 @@
 """
-Stage 3: Structured trajectory synthesis — Gemma-4-31B via SageMaker or Cerebras.
+Stage 3: Structured trajectory synthesis — Gemma-4-31B via SageMaker, Together.ai, or Cerebras.
 
 ARCHITECTURE NOTE — trajectory synthesis, not agent execution:
 
@@ -24,11 +24,12 @@ Why this is the right approach for SFT augmentation at this scale:
 Objective: expand OpenThoughts-Agent-SFT-100K → 250K total (100K original +
 150K synthetic) by augmenting the `conversations` column.
 
-Inference backend (set in .env):
-  SageMaker  — set SAGEMAKER_ENDPOINT_NAME (deploy via deploy_sagemaker.py)
-  Cerebras   — set CEREBRAS_API_KEY (fallback when SAGEMAKER_ENDPOINT_NAME unset)
+Inference backend (set in .env, checked in priority order):
+  SageMaker   — set SAGEMAKER_ENDPOINT_NAME (deploy via deploy_sagemaker.py)
+  Together.ai — set TOGETHER_API_KEY (~$15–20 for 150K samples, recommended)
+  Cerebras    — set CEREBRAS_API_KEY (fallback)
 
-Requires: pip install cerebras-cloud-sdk 'sagemaker<3.0.0' boto3
+Requires: pip install cerebras-cloud-sdk 'sagemaker<3.0.0' boto3 openai
 """
 import asyncio
 import json
@@ -45,12 +46,23 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ── Inference backend ─────────────────────────────────────────────────────────
 SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME")
+TOGETHER_API_KEY        = os.getenv("TOGETHER_API_KEY")
 AWS_REGION              = os.getenv("AWS_REGION", "us-east-1")
-USE_SAGEMAKER           = bool(SAGEMAKER_ENDPOINT_NAME)
+
+USE_SAGEMAKER = bool(SAGEMAKER_ENDPOINT_NAME)
+USE_TOGETHER  = not USE_SAGEMAKER and bool(TOGETHER_API_KEY)
 
 if USE_SAGEMAKER:
     sm_runtime = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
     print(f"Backend: SageMaker endpoint '{SAGEMAKER_ENDPOINT_NAME}'")
+elif USE_TOGETHER:
+    from openai import AsyncOpenAI
+    TOGETHER_MODEL = os.getenv("TOGETHER_MODEL_ID", "meta-llama/Llama-3.3-70B-Instruct-Turbo")
+    client = AsyncOpenAI(
+        api_key=TOGETHER_API_KEY,
+        base_url="https://api.together.xyz/v1",
+    )
+    print(f"Backend: Together.ai model '{TOGETHER_MODEL}'")
 else:
     from cerebras.cloud.sdk import AsyncCerebras
     # MODEL = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")  # Gemma-4-31B (paid tier)
@@ -59,7 +71,7 @@ else:
     print(f"Backend: Cerebras model '{MODEL}'")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONCURRENCY          = 4      # free tier: stay within RPM limits
+CONCURRENCY          = 16 if USE_TOGETHER else 4   # Together.ai handles higher concurrency
 BATCH_SIZE           = 60     # process plan in chunks of 60 variants
 MAX_RETRIES          = 5      # retries on rate-limit / transient errors
 RETRY_BACKOFF_BASE   = 2      # seconds; doubles each retry (2, 4, 8, 16, 32)
@@ -145,6 +157,14 @@ async def synthesize_trajectory(variant: dict, task: dict, sem: asyncio.Semaphor
             try:
                 if USE_SAGEMAKER:
                     raw = await _sm_generate(messages, variant["temperature"])
+                elif USE_TOGETHER:
+                    response = await client.chat.completions.create(
+                        model=TOGETHER_MODEL,
+                        messages=messages,
+                        temperature=variant["temperature"],
+                        max_tokens=MAX_COMPLETION_TOKENS,
+                    )
+                    raw = response.choices[0].message.content or ""
                 else:
                     response = await client.chat.completions.create(
                         model=MODEL,
