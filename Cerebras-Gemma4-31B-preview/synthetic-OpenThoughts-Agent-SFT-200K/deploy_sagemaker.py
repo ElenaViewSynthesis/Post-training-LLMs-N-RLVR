@@ -115,3 +115,18 @@ try:
 except (json.JSONDecodeError, AssertionError) as e:
     print(f"\nWarning: response is not valid pipeline JSON ({e})")
     print("Check the system prompt or model output format before running the full pipeline.")
+
+# ── Reasoning mode test ───────────────────────────────────────────────────────
+print("\nRunning reasoning mode test...")
+reasoning_payload = {
+    "inputs": "Think step by step: How would you design a sustainable city?",
+    "parameters": {
+        "max_new_tokens": 1024,
+        "temperature": 0.7,
+        "enable_reasoning": True,   # Gemma 4 specific feature
+        "reasoning_depth": 3,
+    },
+}
+
+reasoning_response = predictor.predict(reasoning_payload)
+print(reasoning_response)
