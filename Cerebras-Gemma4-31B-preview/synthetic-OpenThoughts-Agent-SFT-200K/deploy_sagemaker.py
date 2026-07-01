@@ -49,6 +49,9 @@ huggingface_model = HuggingFaceModel(
         "MAX_INPUT_LENGTH": "32768",
         "MAX_TOTAL_TOKENS": "65536",
         "HF_TOKEN":         os.environ.get("HF_TOKEN", ""),
+        # Gemma 4 specific optimizations
+        # "OPTION_ENABLE_REASONING_MODE": "true",
+        # "OPTION_MULTIMODAL_SUPPORT":    "true",
     },
     role=role,
     sagemaker_session=sess,
