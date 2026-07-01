@@ -10,7 +10,7 @@ Run once:
     python deploy_sagemaker.py
 
 Then add the printed values to your .env:
-    SAGEMAKER_ENDPOINT_NAME=gemma-4-31b-sft-pipeline
+    SAGEMAKER_ENDPOINT_NAME=gemma-4-31-b-reasoning
     AWS_REGION=us-east-1
 
 After that, gemma4_31b_agent.py routes to SageMaker automatically.
@@ -66,7 +66,7 @@ print("\nDeploying endpoint (this takes 15–30 minutes for a 31B model)...")
 predictor = huggingface_model.deploy(
     initial_instance_count=1,
     instance_type="ml.p4d.24xlarge",
-    endpoint_name="gemma-4-31b-sft-pipeline",
+    endpoint_name="gemma-4-31-b-reasoning",
     volume_size=256,                                    # GB EBS — model is 62GB
     model_data_download_timeout=3600,                  # 1 hr to download from HF
     container_startup_health_check_timeout=3600,       # 1 hr for TGI to load weights
