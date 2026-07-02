@@ -13,13 +13,17 @@ Tests:
     2. sdk_client      — AsyncCerebras client, concurrent calls under a semaphore,
                           matching the call shape used in gemma4_31b_agent.py's
                           synthesize_trajectory(). (implemented)
-    3. single_task     — run one real task from extract_tasks.py through the full
-                          synthesis prompt + parsing logic. (TODO)
+    3. single_task     — pull one real row from the live dataset (extract_tasks.py's
+                          SRC/TRAJECTORY_COL), build the real synthesis prompt
+                          (gemma4_31b_agent.SYSTEM_PROMPT/build_synthesis_prompt),
+                          call Cerebras, and parse the response with the same
+                          logic as synthesize_trajectory(). (implemented)
     4. mini_pipeline   — plan_variants.py -> gemma4_31b_agent.py -> validate_n_dedup.py
                           end-to-end on n=1 task. (TODO)
 """
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -78,8 +82,68 @@ def test_2_sdk_client() -> bool:
     return len(results) == SDK_CLIENT_CALLS and all(r.strip() for r in results)
 
 
+SINGLE_TASK_MAX_TOKENS = 4096  # matches gemma4_31b_agent.py's MAX_COMPLETION_TOKENS
+
+
 def test_3_single_task() -> bool:
-    raise NotImplementedError("run one real task from extract_tasks.py through synthesis + parsing")
+    import dask.dataframe as dd
+    from cerebras.cloud.sdk import Cerebras
+
+    from extract_tasks import SRC, TRAJECTORY_COL
+    from gemma4_31b_agent import SYSTEM_PROMPT, build_synthesis_prompt
+
+    print("[3/single_task] loading one real row from the live dataset...")
+    df = dd.read_parquet(SRC)
+    row = df.head(1).iloc[0]
+    task = row.drop(labels=[TRAJECTORY_COL]).to_dict()
+    print(f"[3/single_task] task fields: {list(task.keys())}")
+
+    # build_synthesis_prompt reads task["instruction"|"prompt"|"task_description"] and
+    # task["environment"|"dockerfile"|"setup_script"]. Surface it loudly if none of those
+    # exist on the real schema, since that would mean the model gets no real task content.
+    text_keys = ("instruction", "prompt", "task_description")
+    if not any(task.get(k) for k in text_keys):
+        print(f"[3/single_task] WARNING: none of {text_keys} present on the real row "
+              f"-> build_synthesis_prompt will fall back to an empty task description")
+
+    variant = {
+        "task_id": task.get("task", "smoke-test-task"),
+        "variant_id": "smoke-test-v0",
+        "temperature": 0.7,
+        "instruction_framing": None,
+    }
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_synthesis_prompt(task, variant["instruction_framing"])},
+    ]
+    print(f"[3/single_task] prompt preview: {messages[1]['content'][:200]!r}")
+
+    client = Cerebras(api_key=os.environ["CEREBRAS_API_KEY"])
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=variant["temperature"],
+        max_completion_tokens=SINGLE_TASK_MAX_TOKENS,
+    )
+    raw = response.choices[0].message.content or ""
+
+    # Same parse logic as synthesize_trajectory()'s Cerebras branch in gemma4_31b_agent.py.
+    try:
+        parsed = json.loads(raw)
+        conversations = parsed.get("conversations")
+        if not isinstance(conversations, list) or not conversations:
+            raise ValueError("missing or empty 'conversations' list")
+        status = "ok"
+    except (json.JSONDecodeError, ValueError) as e:
+        conversations = None
+        status = f"parse_error:{e}"
+
+    n_turns = len(conversations) if conversations else 0
+    print(f"[3/single_task] status={status} turns={n_turns} raw_len={len(raw)}")
+    if status != "ok":
+        print(f"[3/single_task] raw response (truncated): {raw[:300]!r}")
+
+    return status == "ok"
 
 
 def test_4_mini_pipeline() -> bool:
