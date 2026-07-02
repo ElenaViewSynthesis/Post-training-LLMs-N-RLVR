@@ -1,8 +1,9 @@
 """
 Stage 0-1: Load the 100K SFT dataset with dask, assert its actual schema,
-then write a task table — every column except `conversations`.
+then write a task table — every real column plus a derived `instruction`.
 
-Actual schema (confirmed from dataset):
+Actual schema (confirmed from dataset — these are the ONLY real columns;
+there is no flat `instruction`/`prompt`/`task_description` column):
     agent           string   — agent name (e.g. "terminus-2")
     conversations   object   — the multi-turn trajectory (to be regenerated)
     date            string   — ISO timestamp
@@ -15,9 +16,17 @@ Actual schema (confirmed from dataset):
     trace_source    string   — e.g. "main"
     trial_name      string   — unique trial identifier per row
 
-Augmentation strategy: task table = all columns EXCEPT `conversations`.
-We carry the full task context forward into generation and regenerate
-`conversations` only.
+The real task instruction is NOT a separate column — it's embedded inside
+conversations[0] (role="user"), which is the Terminus-2 harness's fixed
+template followed by "Task Description:\n<the actual task>\n\nCurrent
+terminal state:\n...". extract_instruction() below pulls that substring out
+before the `conversations` column is dropped, so downstream synthesis
+(gemma4_31b_agent.build_synthesis_prompt) has real task content to work
+from instead of an empty task section. Confirmed consistent across a
+sample of 8 real rows.
+
+Augmentation strategy: task table = all real columns except `conversations`,
+plus the derived `instruction` column.
 """
 import os
 import json
@@ -32,6 +41,33 @@ TRAJECTORY_COL = "conversations"
 TASK_ID_COL    = "task"          # dedup key for unique tasks
 TASKS_OUT      = Path("~/pipeline/data/tasks/").expanduser()
 
+REAL_COLUMNS = [
+    "agent", "conversations", "date", "episode", "model", "model_provider",
+    "result", "run_id", "task", "trace_source", "trial_name",
+]
+
+TASK_DESC_MARKER     = "Task Description:\n"
+TERMINAL_STATE_MARKER = "\n\nCurrent terminal state:"
+
+
+def extract_instruction(conversations) -> str:
+    """Pull the real task instruction out of conversations[0]'s harness
+    template. Returns "" if the expected markers aren't present (e.g. a
+    differently-formatted row) rather than raising, so callers can detect
+    and log the miss instead of the pipeline crashing on one bad row."""
+    if conversations is None or len(conversations) == 0:
+        return ""
+    first = conversations[0]
+    if first.get("role") != "user":
+        return ""
+    content = first.get("content") or ""
+    start = content.find(TASK_DESC_MARKER)
+    if start == -1:
+        return ""
+    start += len(TASK_DESC_MARKER)
+    end = content.find(TERMINAL_STATE_MARKER, start)
+    return (content[start:end] if end != -1 else content[start:]).strip()
+
 
 def inspect_schema(df: dd.DataFrame) -> None:
     print("=== dtypes ===")
@@ -45,12 +81,18 @@ def inspect_schema(df: dd.DataFrame) -> None:
 
 
 def build_task_table(df: dd.DataFrame) -> dd.DataFrame:
-    """Task table = every column except conversations.
+    """Task table = every column except conversations, plus `instruction`
+    extracted from conversations[0] (see extract_instruction — the real
+    task text lives inside the trajectory, not in a flat column).
     Deduplicated on `task` to get one row per unique task."""
     task_cols = [c for c in df.columns if c != TRAJECTORY_COL]
-    print(f"Task columns:      {task_cols}")
+    print(f"Task columns:      {task_cols} + ['instruction']")
     print(f"Trajectory column: {TRAJECTORY_COL}")
-    tasks = df[task_cols].drop_duplicates(subset=[TASK_ID_COL])
+
+    df = df.assign(
+        instruction=df[TRAJECTORY_COL].apply(extract_instruction, meta=("instruction", "object"))
+    )
+    tasks = df[task_cols + ["instruction"]].drop_duplicates(subset=[TASK_ID_COL])
     return tasks
 
 

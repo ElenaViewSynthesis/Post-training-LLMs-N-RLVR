@@ -89,22 +89,24 @@ def test_3_single_task() -> bool:
     import dask.dataframe as dd
     from cerebras.cloud.sdk import Cerebras
 
-    from extract_tasks import SRC, TRAJECTORY_COL
+    from extract_tasks import SRC, TRAJECTORY_COL, extract_instruction
     from gemma4_31b_agent import SYSTEM_PROMPT, build_synthesis_prompt
 
     print("[3/single_task] loading one real row from the live dataset...")
     df = dd.read_parquet(SRC)
     row = df.head(1).iloc[0]
     task = row.drop(labels=[TRAJECTORY_COL]).to_dict()
+    task["instruction"] = extract_instruction(row[TRAJECTORY_COL])
     print(f"[3/single_task] task fields: {list(task.keys())}")
 
-    # build_synthesis_prompt reads task["instruction"|"prompt"|"task_description"] and
-    # task["environment"|"dockerfile"|"setup_script"]. Surface it loudly if none of those
-    # exist on the real schema, since that would mean the model gets no real task content.
-    text_keys = ("instruction", "prompt", "task_description")
-    if not any(task.get(k) for k in text_keys):
-        print(f"[3/single_task] WARNING: none of {text_keys} present on the real row "
-              f"-> build_synthesis_prompt will fall back to an empty task description")
+    # build_synthesis_prompt reads task["instruction"|"prompt"|"task_description"]; the real
+    # instruction is derived by extract_tasks.extract_instruction() from conversations[0], not
+    # a flat column. Surface it loudly if that came back empty (e.g. an unrecognized row format).
+    if not task.get("instruction"):
+        print("[3/single_task] WARNING: extract_instruction() returned empty "
+              "-> build_synthesis_prompt will fall back to an empty task description")
+    else:
+        print(f"[3/single_task] instruction preview: {task['instruction'][:150]!r}")
 
     variant = {
         "task_id": task.get("task", "smoke-test-task"),
