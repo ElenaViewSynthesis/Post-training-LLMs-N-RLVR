@@ -102,6 +102,23 @@ HF_HUB_ENABLE_HF_TRANSFER=1
 CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
 ```
 
+### 4. Verify the Cerebras backend (optional smoke test)
+
+`test_cerebras_smoke.py` runs a few lightweight checks — API key auth, the
+async SDK client under concurrency, and one real task run through the full
+synthesis + parsing path — without touching the rest of the pipeline:
+
+```bash
+uv run python test_cerebras_smoke.py
+```
+
+This directory has its own `pyproject.toml` + `uv.lock`, scoped to just this
+stage's dependencies (`cerebras-cloud-sdk`, `dask`, `boto3`, `python-dotenv`,
+etc.). `uv run` reads that scoped `pyproject.toml` and materializes an
+isolated `.venv` right here — not the heavy training stack from the parent
+`Cerebras-Gemma4-31B-preview/pyproject.toml` (torch, transformers, trl...),
+which is the whole reason it's scoped separately.
+
 ---
 
 ## Pipeline stages
