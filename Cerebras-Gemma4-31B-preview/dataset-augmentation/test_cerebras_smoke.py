@@ -18,8 +18,12 @@ Tests:
                           (gemma4_31b_agent.SYSTEM_PROMPT/build_synthesis_prompt),
                           call Cerebras, and parse the response with the same
                           logic as synthesize_trajectory(). (implemented)
-    4. mini_pipeline   — plan_variants.py -> gemma4_31b_agent.py -> validate_n_dedup.py
-                          end-to-end on n=1 task. (TODO)
+    4. mini_pipeline   — plan_variants.plan_variants() -> gemma4_31b_agent.
+                          synthesize_trajectory() -> validate_n_dedup.
+                          structural_check()/conversations_fingerprint(),
+                          end-to-end on one real task, n=1 variant, using the
+                          actual production functions (not reimplemented
+                          logic). (implemented)
 """
 import argparse
 import asyncio
@@ -148,8 +152,47 @@ def test_3_single_task() -> bool:
     return status == "ok"
 
 
+async def _mini_pipeline_probe() -> dict:
+    import dask.dataframe as dd
+    import pandas as pd
+
+    from extract_tasks import SRC, TRAJECTORY_COL, extract_instruction
+    from plan_variants import plan_variants
+    from gemma4_31b_agent import synthesize_trajectory
+    from validate_n_dedup import structural_check, conversations_fingerprint
+
+    print("[4/mini_pipeline] loading one real row from the live dataset...")
+    df = dd.read_parquet(SRC)
+    row = df.head(1).iloc[0]
+    task = row.drop(labels=[TRAJECTORY_COL]).to_dict()
+    task["instruction"] = extract_instruction(row[TRAJECTORY_COL])
+
+    # Stage 2: plan_variants.py — plan exactly 1 variant for this 1 task.
+    tasks_pdf = pd.DataFrame([task])
+    plan = plan_variants(tasks_pdf, n_requests=1, seed=42)
+    variant = plan.iloc[0].to_dict()
+    print(f"[4/mini_pipeline] planned variant: {variant}")
+
+    # Stage 3: gemma4_31b_agent.py — the real synthesize_trajectory(), not a stand-in.
+    sem = asyncio.Semaphore(1)
+    result = await synthesize_trajectory(variant, task, sem)
+    n_turns = len(result["conversations"]) if result.get("conversations") else 0
+    print(f"[4/mini_pipeline] synthesis status={result['status']} turns={n_turns}")
+
+    # Stage 5: validate_n_dedup.py — same structural check + fingerprint as the real dedup job.
+    passed_structural = structural_check(result.get("conversations"))
+    fingerprint = conversations_fingerprint(result["conversations"]) if passed_structural else None
+    print(f"[4/mini_pipeline] structural_check={passed_structural} fingerprint={fingerprint}")
+
+    return {
+        "synthesis_status": result["status"],
+        "structural_ok": passed_structural,
+    }
+
+
 def test_4_mini_pipeline() -> bool:
-    raise NotImplementedError("plan_variants.py -> gemma4_31b_agent.py -> validate_n_dedup.py on n=1")
+    outcome = asyncio.run(_mini_pipeline_probe())
+    return outcome["synthesis_status"] == "ok" and outcome["structural_ok"]
 
 
 TESTS = {

@@ -103,9 +103,13 @@ if __name__ == "__main__":
     inspect_schema(df)
     tasks = build_task_table(df)
 
-    n_tasks = len(tasks)
-    print(f"\nUnique tasks: {n_tasks}")
+    # Compute to pandas before writing: dask's multi-partition parquet writer fails
+    # to infer a pyarrow schema for the `instruction` column (object dtype from
+    # .apply()) on some partitions. The deduped task table (~83K rows) fits in
+    # memory comfortably, so write it as a single file via pandas/pyarrow instead.
+    tasks_pdf = tasks.compute()
+    print(f"\nUnique tasks: {len(tasks_pdf)}")
 
     TASKS_OUT.mkdir(parents=True, exist_ok=True)
-    tasks.to_parquet(str(TASKS_OUT), write_index=False)
+    tasks_pdf.to_parquet(TASKS_OUT / "tasks.parquet", index=False)
     print(f"Wrote task table -> {TASKS_OUT}")
