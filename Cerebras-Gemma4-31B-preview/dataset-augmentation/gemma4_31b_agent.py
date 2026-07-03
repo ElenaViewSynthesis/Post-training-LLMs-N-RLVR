@@ -65,8 +65,7 @@ elif USE_TOGETHER:
     print(f"Backend: Together.ai model '{TOGETHER_MODEL}'")
 else:
     from cerebras.cloud.sdk import AsyncCerebras
-    # MODEL = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")  # Gemma-4-31B (paid tier)
-    MODEL  = "zai-glm-4.7"                                   # free tier fallback
+    MODEL  = os.getenv("CEREBRAS_MODEL_ID", "gemma-4-31b")   # Gemma-4-31B (paid tier)
     client = AsyncCerebras(api_key=os.environ["CEREBRAS_API_KEY"])
     print(f"Backend: Cerebras model '{MODEL}'")
 
