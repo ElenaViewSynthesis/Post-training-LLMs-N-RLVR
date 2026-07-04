@@ -169,7 +169,8 @@ The final 250K dataset is synced to a public HuggingFace Bucket using the
 `hf` CLI. `hf_transfer` (enabled by `HF_HUB_ENABLE_HF_TRANSFER=1`) uses
 HuggingFace's prewarmed GCP EU CDN for maximum throughput.
 
-**Bucket:** `hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k`
+**Bucket:** [`borntobeignored/OpenThoughts-Agents-SFT-250k`](https://huggingface.co/buckets/borntobeignored/OpenThoughts-Agents-SFT-250k)
+(CLI path: `hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k`)
 
 ### CLI commands
 
