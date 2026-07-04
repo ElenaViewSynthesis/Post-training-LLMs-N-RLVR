@@ -92,7 +92,7 @@ def test_2_sdk_client() -> bool:
     return len(results) == SDK_CLIENT_CALLS and all(r.strip() for r in results)
 
 
-SINGLE_TASK_MAX_TOKENS = 1024  # matches gemma4_31b_agent.py's MAX_COMPLETION_TOKENS (quota testing)
+SINGLE_TASK_MAX_TOKENS = 2500  # matches gemma4_31b_agent.py's MAX_COMPLETION_TOKENS
 
 
 def test_3_single_task() -> bool:

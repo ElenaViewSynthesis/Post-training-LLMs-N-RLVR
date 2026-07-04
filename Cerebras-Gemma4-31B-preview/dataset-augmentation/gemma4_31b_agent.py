@@ -76,14 +76,15 @@ MAX_RETRIES          = 5      # retries on rate-limit / transient errors
 RETRY_BACKOFF_BASE   = 2      # seconds; doubles each retry (2, 4, 8, 16, 32)
 
 # gemma-4-31b's free tier caps at 1,000,000 tokens/day (see
-# ../cerebras-gemma4-31b-quota.md) -- that's the actual bottleneck on total
-# trace count, not the request caps (5/min, 150/hour, 2,400/day). Maximizing
-# completion size per call makes this WORSE, not better: at ~61K tokens/trace,
-# the 1M/day token budget only covers ~16 traces/day. At 1,024 tokens/trace
-# (this value, set for quota testing), the budget covers ~976 traces/day
-# (1,000,000 / 1,024), and the 150/hour request cap -- not the token cap --
-# ends up dominating minimum runtime (~6.5 hours for 976 requests).
-MAX_COMPLETION_TOKENS = 1024
+# ../cerebras-gemma4-31b-quota.md), so completion size should stay small --
+# but 1,024 was tested empirically (70-request real batch, 2026-07-04) and
+# produced a 2.9% accept rate (68/70 failed, mostly truncated mid-JSON:
+# "unterminated string" / empty response). Real successful trajectories in
+# that same test and earlier pilots consumed 1,602-2,423 completion tokens
+# (18-31 turns), all well above 1,024. 2,500 leaves headroom for that
+# observed range without swinging back to the 4,096+ default that made the
+# daily token budget the bottleneck again.
+MAX_COMPLETION_TOKENS = 2500
 
 OUT_DIR = Path("~/pipeline/data/raw_results").expanduser()
 OUT_DIR.mkdir(parents=True, exist_ok=True)
