@@ -74,7 +74,16 @@ CONCURRENCY          = 16 if USE_TOGETHER else 4   # Together.ai handles higher 
 BATCH_SIZE           = 60     # process plan in chunks of 60 variants
 MAX_RETRIES          = 5      # retries on rate-limit / transient errors
 RETRY_BACKOFF_BASE   = 2      # seconds; doubles each retry (2, 4, 8, 16, 32)
-MAX_COMPLETION_TOKENS = 4096
+
+# gemma-4-31b's free tier caps at 1,000,000 tokens/day (see
+# ../cerebras-gemma4-31b-quota.md) -- that's the actual bottleneck on total
+# trace count, not the request caps (5/min, 150/hour, 2,400/day). Maximizing
+# completion size per call makes this WORSE, not better: at ~61K tokens/trace,
+# the 1M/day token budget only covers ~16 traces/day. At 1,024 tokens/trace
+# (this value, set for quota testing), the budget covers ~976 traces/day
+# (1,000,000 / 1,024), and the 150/hour request cap -- not the token cap --
+# ends up dominating minimum runtime (~6.5 hours for 976 requests).
+MAX_COMPLETION_TOKENS = 1024
 
 OUT_DIR = Path("~/pipeline/data/raw_results").expanduser()
 OUT_DIR.mkdir(parents=True, exist_ok=True)

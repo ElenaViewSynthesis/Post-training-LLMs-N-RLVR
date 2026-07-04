@@ -24,6 +24,12 @@ Tests:
                           end-to-end on one real task, n=1 variant, using the
                           actual production functions (not reimplemented
                           logic). (implemented)
+    5. stage6_reshape — validate_n_dedup's parse/structural/dedup logic ->
+                        augment_150k_rows.reshape_to_original_schema(), run
+                        against the real pilot output already on disk
+                        (~/pipeline/data/pilot/trajectories.jsonl from
+                        run_pilot.py). No new API calls. Never touches
+                        production UPLOAD_DIR or HF_BUCKET. (implemented)
 """
 import argparse
 import asyncio
@@ -86,7 +92,7 @@ def test_2_sdk_client() -> bool:
     return len(results) == SDK_CLIENT_CALLS and all(r.strip() for r in results)
 
 
-SINGLE_TASK_MAX_TOKENS = 4096  # matches gemma4_31b_agent.py's MAX_COMPLETION_TOKENS
+SINGLE_TASK_MAX_TOKENS = 1024  # matches gemma4_31b_agent.py's MAX_COMPLETION_TOKENS (quota testing)
 
 
 def test_3_single_task() -> bool:
@@ -195,11 +201,64 @@ def test_4_mini_pipeline() -> bool:
     return outcome["synthesis_status"] == "ok" and outcome["structural_ok"]
 
 
+PILOT_TRAJECTORIES_PATH = Path("~/pipeline/data/pilot/trajectories.jsonl").expanduser()
+
+
+def test_5_stage6_reshape() -> bool:
+    import pandas as pd
+
+    from extract_tasks import TASKS_OUT, REAL_COLUMNS
+    from validate_n_dedup import parse_result_line, process_partition
+    from augment_150k_rows import reshape_to_original_schema
+
+    if not PILOT_TRAJECTORIES_PATH.exists():
+        print(f"[5/stage6_reshape] no pilot data at {PILOT_TRAJECTORIES_PATH} -- run run_pilot.py first")
+        return False
+
+    with open(PILOT_TRAJECTORIES_PATH) as f:
+        lines = f.readlines()
+
+    # Same parse + structural-check logic as validate_n_dedup.main(), just without dask
+    # (small in-memory list instead of a partitioned bag).
+    parsed = [parse_result_line(line) for line in lines]
+    records = process_partition(parsed)
+    print(f"[5/stage6_reshape] {len(records)}/{len(lines)} pilot records passed parse+structural checks")
+    if not records:
+        print("[5/stage6_reshape] zero validated records -- nothing to reshape")
+        return False
+
+    validated = pd.DataFrame(records)
+    # Mirror validate_n_dedup.main()'s task_id extraction + per-task-id near-dup drop.
+    validated["task_id"] = validated["variant_id"].str.extract(r"^(.*)-v\d+-")
+    before = len(validated)
+    validated = validated.drop_duplicates(subset=["task_id", "fingerprint"])
+    print(f"[5/stage6_reshape] dropped {before - len(validated)} near-duplicate rows")
+
+    tasks_pdf = pd.read_parquet(TASKS_OUT / "tasks.parquet")
+    reshaped = reshape_to_original_schema(validated, tasks_pdf, REAL_COLUMNS)
+    print(f"[5/stage6_reshape] reshaped {len(reshaped)} rows, columns: {list(reshaped.columns)}")
+
+    sample = reshaped.iloc[0]
+    print(f"[5/stage6_reshape] sample row: task={sample['task']} turns={len(sample['conversations'])} "
+          f"is_synthetic_augmentation={sample['is_synthetic_augmentation']} "
+          f"source_task_id={sample['source_task_id']}")
+
+    checks = {
+        "row_count_matches": len(reshaped) == len(validated),
+        "has_conversations": reshaped["conversations"].notna().all(),
+        "is_synthetic_flag_set": bool(reshaped["is_synthetic_augmentation"].all()),
+        "source_task_id_set": reshaped["source_task_id"].notna().all(),
+    }
+    print(f"[5/stage6_reshape] checks: {checks}")
+    return all(checks.values())
+
+
 TESTS = {
     1: ("bare_completion", test_1_bare_completion),
     2: ("sdk_client", test_2_sdk_client),
     3: ("single_task", test_3_single_task),
     4: ("mini_pipeline", test_4_mini_pipeline),
+    5: ("stage6_reshape", test_5_stage6_reshape),
 }
 
 
