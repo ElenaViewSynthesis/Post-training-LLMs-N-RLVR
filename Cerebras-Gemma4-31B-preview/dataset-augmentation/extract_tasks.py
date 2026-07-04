@@ -84,15 +84,19 @@ def build_task_table(df: dd.DataFrame) -> dd.DataFrame:
     """Task table = every column except conversations, plus `instruction`
     extracted from conversations[0] (see extract_instruction — the real
     task text lives inside the trajectory, not in a flat column).
-    Deduplicated on `task` to get one row per unique task."""
+    Deduplicated on `task` to get one row per unique task.
+    Column order: `instruction` is placed right after `agent` (the first
+    column) since it's the most important field to see at a glance."""
     task_cols = [c for c in df.columns if c != TRAJECTORY_COL]
-    print(f"Task columns:      {task_cols} + ['instruction']")
+    agent_idx = task_cols.index("agent")
+    ordered_cols = task_cols[:agent_idx + 1] + ["instruction"] + task_cols[agent_idx + 1:]
+    print(f"Task columns:      {ordered_cols}")
     print(f"Trajectory column: {TRAJECTORY_COL}")
 
     df = df.assign(
         instruction=df[TRAJECTORY_COL].apply(extract_instruction, meta=("instruction", "object"))
     )
-    tasks = df[task_cols + ["instruction"]].drop_duplicates(subset=[TASK_ID_COL])
+    tasks = df[ordered_cols].drop_duplicates(subset=[TASK_ID_COL])
     return tasks
 
 
