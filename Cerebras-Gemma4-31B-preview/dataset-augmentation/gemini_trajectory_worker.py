@@ -22,6 +22,8 @@ Required environment:
     GEMINI_API_KEY
 
 Optional environment:
+    PIPELINE_DATA_DIR        default: ~/pipeline/data
+    HF_RAW_RESULTS_BUCKET    default: hf://buckets/.../raw_results
     GEMINI_MODEL_ID          default: gemini-3.6-flash
     GEMINI_THINKING_LEVEL    default: medium
     GEMINI_CONCURRENCY       default: 4
@@ -38,17 +40,13 @@ import hashlib
 import json
 import math
 import os
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-DEFAULT_DATA_DIR = Path("~/pipeline/data").expanduser()
-DEFAULT_PLAN_PATH = DEFAULT_DATA_DIR / "variant_plan.parquet"
-DEFAULT_TASKS_PATH = DEFAULT_DATA_DIR / "tasks"
-DEFAULT_OUTPUT_PATH = DEFAULT_DATA_DIR / "raw_results" / "trajectories.jsonl"
+DEFAULT_DATA_DIR = Path("~/pipeline/data")
 DEFAULT_HF_BUCKET = (
     "hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k/raw_results"
 )
@@ -110,6 +108,10 @@ class Settings:
     sync_enabled: bool
 
 
+class HFSyncError(RuntimeError):
+    """Raised when authoritative pipeline state cannot be synchronized."""
+
+
 def load_environment() -> None:
     """Load repository-local credentials, with the parent file as fallback.
 
@@ -137,12 +139,33 @@ def _positive_int(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_data_dir = Path(
+        os.getenv("PIPELINE_DATA_DIR", str(DEFAULT_DATA_DIR))
+    ).expanduser()
     parser = argparse.ArgumentParser(
         description="Resume unfinished trajectory variants with the Gemini API."
     )
-    parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN_PATH)
-    parser.add_argument("--tasks", type=Path, default=DEFAULT_TASKS_PATH)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=default_data_dir,
+        help="Pipeline data root used by path defaults (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        help="Variant plan parquet (default: <data-dir>/variant_plan.parquet)",
+    )
+    parser.add_argument(
+        "--tasks",
+        type=Path,
+        help="Task parquet path (default: <data-dir>/tasks)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Result JSONL (default: <data-dir>/raw_results/trajectories.jsonl)",
+    )
     parser.add_argument(
         "--model",
         default=os.getenv("GEMINI_MODEL_ID", "gemini-3.6-flash"),
@@ -179,7 +202,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=int(os.getenv("GEMINI_SYNC_EVERY_BATCHES", "10")),
     )
-    parser.add_argument("--hf-bucket", default=DEFAULT_HF_BUCKET)
+    parser.add_argument(
+        "--hf-bucket",
+        default=os.getenv("HF_RAW_RESULTS_BUCKET", DEFAULT_HF_BUCKET),
+    )
     parser.add_argument(
         "--limit",
         type=_positive_int,
@@ -188,14 +214,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-sync",
         action="store_true",
-        help="Do not run `hf sync` during or after this invocation.",
+        help="Do not synchronize raw results to HF during or after this invocation.",
     )
     parser.add_argument(
         "--status-only",
         action="store_true",
         help="Print resume counts without requiring a Gemini key or making requests.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--sync-to-hf-before-status",
+        action="store_true",
+        help=(
+            "Upload the authoritative local raw-results directory to --hf-bucket "
+            "before calculating --status-only counts."
+        ),
+    )
+    args = parser.parse_args(argv)
+    args.data_dir = args.data_dir.expanduser()
+    args.plan = (args.plan or args.data_dir / "variant_plan.parquet").expanduser()
+    args.tasks = (args.tasks or args.data_dir / "tasks").expanduser()
+    args.output = (
+        args.output or args.data_dir / "raw_results" / "trajectories.jsonl"
+    ).expanduser()
+    if args.sync_to_hf_before_status and not args.status_only:
+        parser.error("--sync-to-hf-before-status requires --status-only")
+    if args.sync_to_hf_before_status and args.no_sync:
+        parser.error("--sync-to-hf-before-status cannot be combined with --no-sync")
+    return args
 
 
 def _is_missing(value: Any) -> bool:
@@ -490,12 +535,19 @@ def should_stop(records: list[dict[str, Any]]) -> tuple[bool, str]:
 
 
 def sync_to_hf(output_path: Path, bucket: str) -> None:
-    subprocess.run(
-        ["hf", "sync", str(output_path.parent), bucket],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        from huggingface_hub import sync_bucket
+    except ImportError as exc:  # pragma: no cover - exercised during setup failures
+        raise HFSyncError(
+            "huggingface_hub with Bucket support is not installed; run `uv sync`"
+        ) from exc
+
+    try:
+        sync_bucket(str(output_path.parent), bucket)
+    except Exception as exc:
+        raise HFSyncError(
+            f"failed to sync {output_path.parent} to {bucket}: {exc}"
+        ) from exc
 
 
 def acquire_run_lock(output_path: Path) -> TextIO:
@@ -513,14 +565,33 @@ def acquire_run_lock(output_path: Path) -> TextIO:
 
 
 async def async_main(args: argparse.Namespace) -> int:
-    (
-        plan,
-        unfinished,
-        task_lookup,
-        completed,
-        existing_records,
-        malformed,
-    ) = load_work(args.plan, args.tasks, args.output, args.limit)
+    status_lock = None
+    if args.sync_to_hf_before_status:
+        if not args.output.exists():
+            raise FileNotFoundError(
+                f"authoritative local result file not found: {args.output}"
+            )
+        status_lock = acquire_run_lock(args.output)
+
+    try:
+        if args.sync_to_hf_before_status:
+            print(
+                f"Syncing authoritative local results from {args.output.parent} "
+                f"to {args.hf_bucket} ..."
+            )
+            sync_to_hf(args.output, args.hf_bucket)
+            print("Raw-result sync complete; calculating resume status.")
+        (
+            plan,
+            unfinished,
+            task_lookup,
+            completed,
+            existing_records,
+            malformed,
+        ) = load_work(args.plan, args.tasks, args.output, args.limit)
+    finally:
+        if status_lock is not None:
+            status_lock.close()
 
     total_remaining = len(plan) - len(completed)
     print(
@@ -629,15 +700,15 @@ async def async_main(args: argparse.Namespace) -> int:
                         try:
                             sync_to_hf(args.output, settings.hf_bucket)
                             print(f"Synced results after batch {batch_number}.")
-                        except (OSError, subprocess.SubprocessError) as exc:
-                            print(f"[hf sync warning] {exc}", file=sys.stderr)
+                        except HFSyncError as exc:
+                            print(f"[HF sync warning] {exc}", file=sys.stderr)
 
             if settings.sync_enabled:
                 try:
                     sync_to_hf(args.output, settings.hf_bucket)
                     print("Final result sync complete.")
-                except (OSError, subprocess.SubprocessError) as exc:
-                    print(f"[hf sync warning] {exc}", file=sys.stderr)
+                except HFSyncError as exc:
+                    print(f"[HF sync warning] {exc}", file=sys.stderr)
             return 0
         finally:
             await client.aclose()
