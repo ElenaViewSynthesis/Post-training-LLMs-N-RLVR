@@ -34,12 +34,12 @@ Requires: pip install cerebras-cloud-sdk 'sagemaker<3.0.0' boto3 openai
 import asyncio
 import json
 import os
-import subprocess
 from pathlib import Path
 
 import boto3
 import pandas as pd
 from dotenv import load_dotenv
+from huggingface_hub import sync_bucket
 from tqdm.asyncio import tqdm as atqdm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -95,10 +95,7 @@ SYNC_EVERY_N_BATCHES = 10    # sync to HF bucket every N batches (~600 records)
 
 def sync_to_hf():
     try:
-        subprocess.run(
-            ["hf", "sync", str(OUT_DIR), HF_BUCKET],
-            check=True, capture_output=True,
-        )
+        sync_bucket(str(OUT_DIR), HF_BUCKET)
     except Exception as e:
         print(f"\n[hf sync warning] {e} — continuing without sync")
 
