@@ -142,9 +142,10 @@ marker and does not need to run.
 ## Continue with Gemini after a Cerebras limit
 
 The Gemini worker reads the existing plan and task parquet files and appends to
-the existing `~/pipeline/data/raw_results/trajectories.jsonl`. It skips only
-variant IDs that already have a `status: "ok"` record, so Cerebras failures are
-retried and successful Cerebras output is preserved.
+`<data-dir>/raw_results/trajectories.jsonl`. The data root defaults to
+`~/pipeline/data` and can be set with `PIPELINE_DATA_DIR` or `--data-dir`. It
+skips only variant IDs that already have a `status: "ok"` record, so Cerebras
+failures are retried and successful Cerebras output is preserved.
 
 ```bash
 # Inspect progress without an API call.
@@ -157,6 +158,28 @@ uv run python gemini_trajectory_worker.py --limit 1 --no-sync
 uv run python gemini_trajectory_worker.py
 ```
 
+For the current WSL setup, the authoritative state is on the Windows-mounted
+drive. Set it once in the ignored local `.env`:
+
+```bash
+PIPELINE_DATA_DIR=/mnt/c/Users/proxi/pipeline/data
+```
+
+Before trusting a final resume count, upload that authoritative local
+`raw_results` directory to the HF bucket and then calculate status under the
+same process lock:
+
+```bash
+uv run python gemini_trajectory_worker.py \
+  --status-only \
+  --sync-to-hf-before-status
+```
+
+This synchronization is deliberately one-way: local `raw_results` →
+`HF_RAW_RESULTS_BUCKET`. It catches up results created with `--no-sync` and
+fails without printing a count if the upload fails. It never downloads over
+the authoritative local JSONL.
+
 The default is stable `gemini-3.6-flash` through Gemini's Interactions API,
 using structured JSON output and `medium` thinking. Gemini 3.6 deprecates
 sampling temperature, so the existing plan's temperature remains in output
@@ -166,6 +189,16 @@ thinking level with `GEMINI_MODEL_ID`, `GEMINI_THINKING_LEVEL`, `--model`, or
 `--thinking-level`. The worker stops after a fully failed batch or an
 authentication/configuration error so a bad key or exhausted quota does not
 fill the JSONL with repeated failures.
+
+Run Stage 5 against the same configured data root after raw generation:
+
+```bash
+uv run python validate_n_dedup.py
+```
+
+`validate_n_dedup.py` also accepts `--data-dir`, `--raw-results-dir`, and
+`--output` overrides. Its default output is
+`<data-dir>/validated/validated_trajectories.parquet`.
 
 ## Before running at full scale: pilot first
 
@@ -195,11 +228,11 @@ only the `base_url` and `api_key`.
 
 ---
 
-## Output: HuggingFace Bucket via `hf sync` (GCP EU CDN)
+## Output: HuggingFace Bucket via `sync_bucket` (GCP EU CDN)
 
-The final 250K dataset is synced to a public HuggingFace Bucket using the
-`hf` CLI. `hf_transfer` (enabled by `HF_HUB_ENABLE_HF_TRANSFER=1`) uses
-HuggingFace's prewarmed GCP EU CDN for maximum throughput.
+The final 250K dataset is synced to a public HuggingFace Bucket through
+`huggingface_hub.sync_bucket`. The `hf buckets sync` commands below provide
+equivalent manual upload and download operations.
 
 **Bucket:** [`borntobeignored/OpenThoughts-Agents-SFT-250k`](https://huggingface.co/buckets/borntobeignored/OpenThoughts-Agents-SFT-250k)
 (CLI path: `hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k`)
@@ -211,17 +244,17 @@ HuggingFace's prewarmed GCP EU CDN for maximum throughput.
 uv tool install hf
 
 # Upload local parquet shards to bucket
-hf sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+hf buckets sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
 
 # Download bucket to local folder
-hf sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
+hf buckets sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
 ```
 
 ### What Stage 6 does
 
 1. Merges original 100K rows + ~150K validated synthetic rows
 2. Writes sharded parquet files to `~/pipeline/data/upload/`
-3. Runs `hf sync` to push all shards to the HF bucket
+3. Runs `huggingface_hub.sync_bucket` to push all shards to the HF bucket
 4. Prints the download command on completion
 
 ### Local intermediate data layout
