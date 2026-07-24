@@ -1,27 +1,26 @@
 """
 Stage 6: Merge original 100K rows with accepted new synthetic rows, reshape
 them into the original schema (preserving the `conversations` column structure),
-and sync the final ~250K dataset to HuggingFace Bucket via `hf sync`.
+and sync the final ~250K dataset with ``huggingface_hub.sync_bucket``.
 
 Upload path:
-    local sharded parquet → hf sync → hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+    local sharded parquet → sync_bucket → hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
 
-Requires the `hf` CLI to be installed:
-    uv tool install hf
+Requires ``huggingface_hub`` with Bucket support (installed by this project).
+The equivalent manual CLI commands are:
 
 Sync commands:
-    Upload:   hf sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
-    Download: hf sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
+    Upload:   hf buckets sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+    Download: hf buckets sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
 
 Objective: OpenThoughts-Agent-SFT-100K → 250K total (100K original + 150K synthetic) by augmenting `conversations`.
 """
-import os
-import subprocess
 from pathlib import Path
 
 import dask.dataframe as dd
 import pandas as pd
 from dotenv import load_dotenv
+from huggingface_hub import sync_bucket
 
 load_dotenv()
 
@@ -81,15 +80,12 @@ def main():
         name_function=lambda i: f"train-{i:05d}-of-{combined.npartitions:05d}.parquet",
     )
 
-    # ── Sync to HuggingFace Bucket via hf CLI ─────────────────────────────────
+    # ── Sync to HuggingFace Bucket ────────────────────────────────────────────
     print(f"Syncing to {HF_BUCKET} ...")
-    subprocess.run(
-        ["hf", "sync", str(UPLOAD_DIR), HF_BUCKET],
-        check=True,
-    )
+    sync_bucket(str(UPLOAD_DIR), HF_BUCKET)
 
     print(f"Done. Bucket: {HF_BUCKET}")
-    print(f"Download with: hf sync {HF_BUCKET} ./local")
+    print(f"Download with: hf buckets sync {HF_BUCKET} ./local")
 
 
 if __name__ == "__main__":
