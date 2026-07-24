@@ -525,7 +525,7 @@ requires-dist = [
     { name = "fsspec", specifier = ">=2024.1.0" },
     { name = "google-genai", extras = ["aiohttp"], specifier = ">=2.0.0" },
     { name = "hf-transfer", specifier = ">=0.1.6" },
-    { name = "huggingface-hub", specifier = ">=0.23.0" },
+    { name = "huggingface-hub", specifier = ">=1.21.0" },
     { name = "openai", specifier = ">=1.30.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pyarrow", specifier = ">=15.0.0" },
