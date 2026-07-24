@@ -11,7 +11,7 @@ dependencies = [
     "fsspec>=2024.1.0",
 
     # HuggingFace — streaming (hf:// protocol), fast CDN upload, dataset push
-    "huggingface_hub>=0.23.0",
+    "huggingface_hub>=1.21.0",
     "hf_transfer>=0.1.6",
     "datasets>=2.19.0",
 
