@@ -101,7 +101,8 @@ GEMINI_API_KEY=your_gemini_api_key_here
 HF_TOKEN=your_huggingface_read_token_here
 HF_HUB_ENABLE_HF_TRANSFER=1
 CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
-GEMINI_MODEL_ID=gemini-2.5-flash
+GEMINI_MODEL_ID=gemini-3.6-flash
+GEMINI_THINKING_LEVEL=medium
 ```
 
 ### 4. Verify the Cerebras backend (optional smoke test)
@@ -156,10 +157,14 @@ uv run python gemini_trajectory_worker.py --limit 1 --no-sync
 uv run python gemini_trajectory_worker.py
 ```
 
-The default is stable `gemini-2.5-flash`, which supports the planned
-temperature values and Gemini structured JSON output. Override it with
-`GEMINI_MODEL_ID` or `--model`. The worker stops after a fully failed batch or
-an authentication/configuration error so a bad key or exhausted quota does not
+The default is stable `gemini-3.6-flash` through Gemini's Interactions API,
+using structured JSON output and `medium` thinking. Gemini 3.6 deprecates
+sampling temperature, so the existing plan's temperature remains in output
+metadata but is not sent to Gemini; diversity instead comes from instruction
+framing, per-variant seeds, and model nondeterminism. Override the model or
+thinking level with `GEMINI_MODEL_ID`, `GEMINI_THINKING_LEVEL`, `--model`, or
+`--thinking-level`. The worker stops after a fully failed batch or an
+authentication/configuration error so a bad key or exhausted quota does not
 fill the JSONL with repeated failures.
 
 ## Before running at full scale: pilot first

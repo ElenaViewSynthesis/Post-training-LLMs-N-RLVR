@@ -13,7 +13,7 @@ datasets>=2.19.0
 cerebras-cloud-sdk>=1.0.0
 
 # Gemini Developer API (resume worker after Cerebras quota exhaustion)
-google-genai[aiohttp]>=1.33.0
+google-genai[aiohttp]>=2.0.0
 
 # SageMaker deployment + inference (deploy_sagemaker.py + gemma4_31b_agent.py)
 sagemaker<3.0.0
