@@ -22,7 +22,8 @@ Required environment:
     GEMINI_API_KEY
 
 Optional environment:
-    GEMINI_MODEL_ID          default: gemini-2.5-flash
+    GEMINI_MODEL_ID          default: gemini-3.6-flash
+    GEMINI_THINKING_LEVEL    default: medium
     GEMINI_CONCURRENCY       default: 4
     GEMINI_BATCH_SIZE        default: 60
     GEMINI_MAX_OUTPUT_TOKENS default: 4096
@@ -99,6 +100,7 @@ TRAJECTORY_JSON_SCHEMA = {
 @dataclass(frozen=True)
 class Settings:
     model: str
+    thinking_level: str
     concurrency: int
     batch_size: int
     max_output_tokens: int
@@ -143,8 +145,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument(
         "--model",
-        default=os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash"),
+        default=os.getenv("GEMINI_MODEL_ID", "gemini-3.6-flash"),
         help="Gemini model ID (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--thinking-level",
+        choices=("medium", "high"),
+        default=os.getenv("GEMINI_THINKING_LEVEL", "medium"),
+        help="Gemini 3.6 thinking level (default: %(default)s)",
     )
     parser.add_argument(
         "--concurrency",
@@ -288,15 +296,17 @@ def load_work(plan_path: Path, tasks_path: Path, output_path: Path, limit: int |
     return plan, unfinished, task_lookup, completed, existing_records, malformed
 
 
-def _usage_dict(response: Any) -> dict[str, int]:
-    usage = getattr(response, "usage_metadata", None)
+def _usage_dict(interaction: Any) -> dict[str, int]:
+    usage = getattr(interaction, "usage", None)
     if usage is None:
         return {}
     fields = (
-        "prompt_token_count",
-        "candidates_token_count",
-        "thoughts_token_count",
-        "total_token_count",
+        "total_input_tokens",
+        "total_output_tokens",
+        "total_thought_tokens",
+        "total_tokens",
+        "total_tool_use_tokens",
+        "total_cached_tokens",
     )
     return {
         field: int(value)
@@ -336,13 +346,15 @@ def _safe_error(exc: Exception, api_key: str) -> tuple[str, int | None]:
     return f"{prefix}:{message}", code
 
 
-def _base_record(variant: dict[str, Any], model: str) -> dict[str, Any]:
+def _base_record(variant: dict[str, Any], settings: Settings) -> dict[str, Any]:
     return {
         "variant_id": str(variant["variant_id"]),
         "task_id": str(variant["task_id"]),
         "temperature": float(variant["temperature"]),
+        "temperature_applied": False,
         "provider": "gemini",
-        "model": model,
+        "model": settings.model,
+        "thinking_level": settings.thinking_level,
     }
 
 
@@ -354,33 +366,38 @@ async def synthesize_trajectory(
     api_key: str,
     semaphore: asyncio.Semaphore,
 ) -> dict[str, Any]:
-    base = _base_record(variant, settings.model)
+    base = _base_record(variant, settings)
     variant_id = base["variant_id"]
     prompt = build_synthesis_prompt(task, variant.get("instruction_framing"))
 
-    # Gemini 2.5 Flash supports temperature and thinking_budget=0. Keeping
-    # hidden thinking off reserves the output budget for the actual trajectory.
-    config = {
-        "system_instruction": SYSTEM_PROMPT,
-        "temperature": base["temperature"],
-        "max_output_tokens": settings.max_output_tokens,
-        "response_mime_type": "application/json",
-        "response_json_schema": TRAJECTORY_JSON_SCHEMA,
-        "thinking_config": {"thinking_budget": 0},
-        "seed": variant_seed(variant_id),
-    }
-
     async with semaphore:
         try:
-            response = await client.models.generate_content(
+            interaction = await client.interactions.create(
                 model=settings.model,
-                contents=prompt,
-                config=config,
+                input=prompt,
+                system_instruction=SYSTEM_PROMPT,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": TRAJECTORY_JSON_SCHEMA,
+                },
+                generation_config={
+                    "max_output_tokens": settings.max_output_tokens,
+                    "thinking_level": settings.thinking_level,
+                    "seed": variant_seed(variant_id),
+                },
+                store=False,
             )
-            parsed = getattr(response, "parsed", None)
-            raw = getattr(response, "text", None) or ""
-            if not isinstance(parsed, dict):
-                parsed = json.loads(raw)
+            interaction_status = getattr(interaction, "status", None)
+            interaction_status = getattr(
+                interaction_status, "value", interaction_status
+            )
+            if interaction_status not in (None, "completed"):
+                raise ValueError(
+                    f"interaction finished with status {interaction_status!r}"
+                )
+            raw = getattr(interaction, "output_text", None) or ""
+            parsed = json.loads(raw)
             conversations = validate_conversations(parsed.get("conversations"))
 
             return {
@@ -388,7 +405,8 @@ async def synthesize_trajectory(
                 "status": "ok",
                 "conversations": conversations,
                 "raw": None,
-                "usage": _usage_dict(response),
+                "interaction_id": getattr(interaction, "id", None),
+                "usage": _usage_dict(interaction),
             }
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             status, code = _safe_error(exc, api_key)
@@ -434,7 +452,7 @@ async def run_batch(
         task = task_lookup.get(task_id)
         if task is None:
             record = {
-                **_base_record(variant, settings.model),
+                **_base_record(variant, settings),
                 "status": "error:MissingTask",
                 "error_code": None,
                 "conversations": None,
@@ -530,6 +548,7 @@ async def async_main(args: argparse.Namespace) -> int:
 
     settings = Settings(
         model=args.model,
+        thinking_level=args.thinking_level,
         concurrency=args.concurrency,
         batch_size=args.batch_size,
         max_output_tokens=args.max_output_tokens,
@@ -540,7 +559,8 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     print(
         f"Backend: Gemini model={settings.model!r} concurrency={settings.concurrency} "
-        f"batch_size={settings.batch_size} max_output_tokens={settings.max_output_tokens}"
+        f"batch_size={settings.batch_size} thinking_level={settings.thinking_level} "
+        f"max_output_tokens={settings.max_output_tokens}"
     )
 
     # The official SDK retries 408, 429, and 5xx responses with jittered
@@ -552,7 +572,7 @@ async def async_main(args: argparse.Namespace) -> int:
         sync_client = genai.Client(
             api_key=api_key,
             http_options={
-                "api_version": "v1",
+                "api_version": "v1beta",
                 "timeout": settings.timeout_ms,
                 "retry_options": {
                     "attempts": 5,
