@@ -97,9 +97,11 @@ cp .env.example .env
 
 ```
 CEREBRAS_API_KEY=your_cerebras_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 HF_TOKEN=your_huggingface_read_token_here
 HF_HUB_ENABLE_HF_TRANSFER=1
 CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
+GEMINI_MODEL_ID=gemini-2.5-flash
 ```
 
 ### 4. Verify the Cerebras backend (optional smoke test)
@@ -128,12 +130,37 @@ which is the whole reason it's scoped separately.
 | 0-1 | `extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
 | 2 | `plan_variants.py` | pandas | builds the diversity plan via temperature + framing |
 | 3 | `gemma4_31b_agent.py` | async API | structured trajectory synthesis via Cerebras Inference + Gemma-4-31B; streams results as they finish |
+| 3b | `gemini_trajectory_worker.py` | async API | resume unfinished variants with Gemini; appends to the same JSONL and skips successful IDs |
 | 4 | `poll_n_fetch.py` | — | obsolete on the Cerebras path (no batch to poll); worker is itself resume-safe |
 | 5 | `validate_n_dedup.py` | dask | parse/structural checks, near-dup filter, (optional) verifier replay |
 | 6 | `augment_150k_rows.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to HF bucket |
 
-Run in order. Stage 4 is poll-and-resume safe — re-run it until it reports
-all batches retrieved.
+Run in order. The Stage 3 workers are resume-safe; Stage 4 is only an obsolete
+marker and does not need to run.
+
+## Continue with Gemini after a Cerebras limit
+
+The Gemini worker reads the existing plan and task parquet files and appends to
+the existing `~/pipeline/data/raw_results/trajectories.jsonl`. It skips only
+variant IDs that already have a `status: "ok"` record, so Cerebras failures are
+retried and successful Cerebras output is preserved.
+
+```bash
+# Inspect progress without an API call.
+uv run python gemini_trajectory_worker.py --status-only
+
+# Make one paid request first and inspect its output.
+uv run python gemini_trajectory_worker.py --limit 1 --no-sync
+
+# Resume all remaining variants.
+uv run python gemini_trajectory_worker.py
+```
+
+The default is stable `gemini-2.5-flash`, which supports the planned
+temperature values and Gemini structured JSON output. Override it with
+`GEMINI_MODEL_ID` or `--model`. The worker stops after a fully failed batch or
+an authentication/configuration error so a bad key or exhausted quota does not
+fill the JSONL with repeated failures.
 
 ## Before running at full scale: pilot first
 

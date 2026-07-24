@@ -18,6 +18,9 @@ dependencies = [
     # Cerebras Inference (teacher model — fallback when SageMaker endpoint not set)
     "cerebras-cloud-sdk>=1.0.0",
 
+    # Gemini Developer API (resume worker after Cerebras quota exhaustion)
+    "google-genai[aiohttp]>=1.33.0",
+
     # SageMaker deployment + inference (deploy_sagemaker.py + gemma4_31b_agent.py)
     "sagemaker<3.0.0",
     "boto3>=1.34.0",
