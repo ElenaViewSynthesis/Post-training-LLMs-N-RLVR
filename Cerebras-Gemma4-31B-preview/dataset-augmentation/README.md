@@ -1,276 +1,256 @@
-# OpenThoughts-Agent-SFT 100K → 200K augmentation pipeline
+# OpenThoughts-Agent-SFT source-row refinement pipeline
 
 ## Objective
 
-Expand **OpenThoughts-Agent-SFT-100K** to **200K traces** by augmenting the
-`conversations` column using **Gemma-4-31B Early Preview** on **Cerebras
-Inference**. The task distribution is preserved — the same 100K tasks get new
-synthetic conversation trajectories, not new tasks.
+Preserve every row from `OpenThoughts-Agent-SFT-100K` and add exactly 150,000
+refined conversations. The configured source currently contains 94,334
+physical rows, so the expected publication is 244,334 rows. Stage 6 derives
+that total from the source instead of trusting the dataset's `100K` label.
 
-## What this does
+The current pipeline does not oversample and does not create multiple accepted
+candidates for a refinement slot. It assigns:
 
-Takes the 100K-trace SFT dataset, treats each row as a **task** (instruction +
-environment) decoupled from its **conversations** (the trajectory), generates
-~1.5× oversampled new synthetic conversations for the same tasks, validates and
-dedups, then merges back with the original 100K to land at 200K total rows.
+- one refinement to every source row; and
+- one additional refinement to a deterministic 55,666-row subset.
 
-## Architecture: structured trajectory synthesis, not agent execution
+The subset is chosen by a stable hash of a physical source-row identity derived
+from the sorted Parquet file path and row index. Both `run_id` and `trial_name`
+repeat in the real data, so neither is safe as a row key. They and the original
+task remain lineage metadata. A rejected generation is retried for the same
+slot until a result passes validation. The first accepted result completes that
+slot permanently.
 
-The original dataset was built with a live agent runtime (Terminus-2 harness):
-a model executed real bash commands in a sandboxed environment. This pipeline
-uses a different and more scalable approach — **structured trajectory synthesis**:
+## Architecture
 
-> Gemma-4-31B generates a complete synthetic conversation in a single inference
-> call, conditioned on the original task and augmentation strategy. The model
-> produces all turns — reasoning, tool calls, observations, and the final answer —
-> without any live sandbox environment.
+```text
+source Parquet row groups
+        │
+        ├── deterministic refinement slots (150K exact)
+        │
+        ├── bounded-concurrency Gemini requests
+        │       ├── reject → retry same slot
+        │       └── accept → atomic Parquet shard
+        │
+        └── Stage 6 preflight
+                ├── verify all source relationships and schemas
+                ├── stream every original + 150K refined rows
+                ├── verify the derived physical Parquet row count
+                └── promote and optionally sync a versioned publication
+```
 
-**Why this is correct for large-scale SFT augmentation:**
-- Agent execution requires container orchestration and is 10–100× slower per sample.
-- Trajectory synthesis runs at Cerebras throughput speeds, making 100K+ new samples practical.
-- For SFT, the student model learns from the conversation pattern — well-structured
-  synthetic trajectories are sufficient signal.
-- Quality is enforced post-generation by the validation pipeline (Stage 5): schema
-  validation, semantic similarity filtering, safety checks, and diversity scoring.
+The model refines an existing source conversation in a single structured-output
+request. Tool calls and observations remain synthetic; this pipeline does not
+execute them in a live sandbox.
 
-This demonstrates the distinction between **agent execution** (live environment,
-real tool calls) and **trajectory generation** (structured synthesis conditioned
-on task context) — the latter being the appropriate choice here.
+## Safety properties
 
-## Teacher: Gemma-4-31B via Cerebras Inference
-
-The pipeline uses **Gemma-4-31B Early Preview** via the **Cerebras Inference
-API** (`cerebras-cloud-sdk`, OpenAI-compatible). Cerebras hardware delivers
-extremely high token throughput, making it well-suited for synthesizing large
-volumes of multi-turn conversations.
-
-Key design points:
-
-1. **Single inference call per variant.** One request generates a complete
-   `conversations` list (all turns) as structured JSON. No multi-turn loop,
-   no sandbox — just high-throughput structured generation.
-
-2. **Temperature-based diversity.** Gemma-4-31B on Cerebras has no restriction
-   on sampling parameters. Temperature varies across [0.7, 0.85, 1.0] with a
-   weighted distribution biased toward 0.85. See `plan_variants.py`.
-
-3. **Engineered synthesis prompt.** The system prompt instructs the model to
-   produce realistic step-by-step reasoning before tool calls, plausible bash
-   command sequences, realistic observations, and a conclusive final answer —
-   matching the style of the original dataset.
-
-**Throughput ceiling is `CONCURRENCY` + Cerebras RPM limits**, not token
-generation speed. Start at 32 concurrent workers, watch for 429s, ramp up.
-Set `CEREBRAS_API_KEY` in your `.env` (see `.env.example`).
+- API calls are concurrent but bounded by `--concurrency`.
+- Only one worker can own a refinement output directory.
+- Every paid request is assigned to a deterministic source row and slot.
+- All source identities and conversations are checked before paid requests.
+- Generated conversations must remain nested `{role, content}` records, contain
+  2–40 non-empty turns, and end with an assistant turn.
+- Accepted rows use an explicit Arrow schema and atomic immutable shards.
+- Resume state is derived from accepted Parquet shards, not optimistic counters.
+- Duplicate or unknown synthetic IDs stop the run.
+- Stage 6 dry-run performs no local or remote writes.
+- Stage 6 always writes to a fresh staging directory.
+- A publication is promoted only after schema, checksum, and physical row-count
+  validation succeeds.
+- Remote publication uses a versioned destination and a failed final sync exits
+  nonzero.
 
 ## Setup
 
-### 1. Install pip (WSL / Ubuntu — if not already present)
-
 ```bash
-sudo apt update && sudo apt install -y python3-pip
-```
-
-### 2. Install pipeline dependencies
-
-```bash
-cd cerebras-gemma4-31b-preview/synthetic-openthoughts-agent-sft-200k
 bash install.sh
-```
-
-`install.sh` creates a `.venv` virtual environment, installs all dependencies
-into it, enables `HF_HUB_ENABLE_HF_TRANSFER=1`, and creates the local pipeline
-data directories under `~/pipeline/data/`.
-
-**Activate the venv before every session:**
-```bash
 source .venv/bin/activate
-```
-
-### 3. Configure credentials
-
-Copy `.env.example` to `.env` and fill in your keys:
-
-```bash
 cp .env.example .env
 ```
 
-```
-CEREBRAS_API_KEY=your_cerebras_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here
-HF_TOKEN=your_huggingface_read_token_here
-HF_HUB_ENABLE_HF_TRANSFER=1
-CEREBRAS_MODEL_ID=cerebras/Gemma4-31B-preview
-GEMINI_MODEL_ID=gemini-3.6-flash
-GEMINI_THINKING_LEVEL=medium
-```
+Required configuration:
 
-### 4. Verify the Cerebras backend (optional smoke test)
-
-`test_cerebras_smoke.py` runs a few lightweight checks — API key auth, the
-async SDK client under concurrency, and one real task run through the full
-synthesis + parsing path — without touching the rest of the pipeline:
-
-```bash
-uv run python test_cerebras_smoke.py
-```
-
-This directory has its own `pyproject.toml` + `uv.lock`, scoped to just this
-stage's dependencies (`cerebras-cloud-sdk`, `dask`, `boto3`, `python-dotenv`,
-etc.). `uv run` reads that scoped `pyproject.toml` and materializes an
-isolated `.venv` right here — not the heavy training stack from the parent
-`Cerebras-Gemma4-31B-preview/pyproject.toml` (torch, transformers, trl...),
-which is the whole reason it's scoped separately.
-
----
-
-## Pipeline stages
-
-| Stage | File | Runs on | Notes |
-|---|---|---|---|
-| 0-1 | `extract_tasks.py` | dask | introspects real schema, splits task vs. trajectory columns |
-| 2 | `plan_variants.py` | pandas | builds the diversity plan via temperature + framing |
-| 3 | `gemma4_31b_agent.py` | async API | structured trajectory synthesis via Cerebras Inference + Gemma-4-31B; streams results as they finish |
-| 3b | `gemini_trajectory_worker.py` | async API | resume unfinished variants with Gemini; appends to the same JSONL and skips successful IDs |
-| 4 | `poll_n_fetch.py` | — | obsolete on the Cerebras path (no batch to poll); worker is itself resume-safe |
-| 5 | `validate_n_dedup.py` | dask | parse/structural checks, near-dup filter, (optional) verifier replay |
-| 6 | `augment_150k_rows.py` | dask | reshapes to original schema, concatenates, writes 250K parquet to HF bucket |
-
-Run in order. The Stage 3 workers are resume-safe; Stage 4 is only an obsolete
-marker and does not need to run.
-
-## Continue with Gemini after a Cerebras limit
-
-The Gemini worker reads the existing plan and task parquet files and appends to
-`<data-dir>/raw_results/trajectories.jsonl`. The data root defaults to
-`~/pipeline/data` and can be set with `PIPELINE_DATA_DIR` or `--data-dir`. It
-skips only variant IDs that already have a `status: "ok"` record, so Cerebras
-failures are retried and successful Cerebras output is preserved.
-
-```bash
-# Inspect progress without an API call.
-uv run python gemini_trajectory_worker.py --status-only
-
-# Make one paid request first and inspect its output.
-uv run python gemini_trajectory_worker.py --limit 1 --no-sync
-
-# Resume all remaining variants.
-uv run python gemini_trajectory_worker.py
-```
-
-For the current WSL setup, the authoritative state is on the Windows-mounted
-drive. Set it once in the ignored local `.env`:
-
-```bash
+```dotenv
+GEMINI_API_KEY=...
+HF_TOKEN=...
 PIPELINE_DATA_DIR=/mnt/c/Users/proxi/pipeline/data
 ```
 
-Before trusting a final resume count, upload that authoritative local
-`raw_results` directory to the HF bucket and then calculate status under the
-same process lock:
+Useful optional settings:
+
+```dotenv
+GEMINI_MODEL_ID=gemini-3.6-flash
+GEMINI_CONCURRENCY=4
+GEMINI_MAX_OUTPUT_TOKENS=4096
+REFINEMENT_REQUEST_BATCH_SIZE=32
+REFINEMENT_MAX_ATTEMPTS_PER_RUN=3
+```
+
+The data directory defaults to `~/pipeline/data`. In the current WSL setup,
+`/mnt/c/Users/proxi/pipeline/data` is authoritative.
+
+## Stage 3–5: streaming refinement
+
+The source dataset is read twice before requests begin: first for the compact
+physical-row → (`trial_name`, `run_id`, `task`) identity map, then for
+complete source-row validation. Requests then run in bounded batches. Only the
+active request batch and one accepted output batch are held in memory.
+
+Check status without initializing Gemini:
 
 ```bash
-uv run python gemini_trajectory_worker.py \
-  --status-only \
-  --sync-to-hf-before-status
+uv run python stream_refinement_worker.py --status-only
 ```
 
-This synchronization is deliberately one-way: local `raw_results` →
-`HF_RAW_RESULTS_BUCKET`. It catches up results created with `--no-sync` and
-fails without printing a count if the upload fails. It never downloads over
-the authoritative local JSONL.
-
-The default is stable `gemini-3.6-flash` through Gemini's Interactions API,
-using structured JSON output and `medium` thinking. Gemini 3.6 deprecates
-sampling temperature, so the existing plan's temperature remains in output
-metadata but is not sent to Gemini; diversity instead comes from instruction
-framing, per-variant seeds, and model nondeterminism. Override the model or
-thinking level with `GEMINI_MODEL_ID`, `GEMINI_THINKING_LEVEL`, `--model`, or
-`--thinking-level`. The worker stops after a fully failed batch or an
-authentication/configuration error so a bad key or exhausted quota does not
-fill the JSONL with repeated failures.
-
-Run Stage 5 against the same configured data root after raw generation:
+Make one request without remote synchronization:
 
 ```bash
-uv run python validate_n_dedup.py
+uv run python stream_refinement_worker.py --limit 1 --no-sync
 ```
 
-`validate_n_dedup.py` also accepts `--data-dir`, `--raw-results-dir`, and
-`--output` overrides. Its default output is
-`<data-dir>/validated/validated_trajectories.parquet`.
-
-## Before running at full scale: pilot first
-
-Run stages 2-5 on a 500-1,000 task sample before committing the full 150K
-request budget. You need this to calibrate:
-- **Rejection rate** out of Stage 5 → tunes `OVERSAMPLE_FACTOR` in stage 2.
-- **Degenerate-output rate** (model refusing to act as a terminal agent) →
-  tunes the regex filter in `validate_n_dedup.py`.
-- **Optimal temperature** — calibrate which temperature in [0.7, 0.85, 1.0] gives
-  the best Stage 5 acceptance rate and tighten the weights in `plan_variants.py` before the full run.
-- **Synthesis prompt quality** — inspect a sample of generated `conversations` from the pilot
-  to verify the model is producing realistic tool-call/observation sequences, not hallucinated
-  or refusal outputs.
-
-## Why the real agent loop (and not a batch / simulated approach)
-
-A batch API fundamentally can't run a multi-turn tool loop — each batched
-request is one self-contained call with no environment in between — so batch
-always implies simulated trajectories. The Cerebras async worker runs the real
-loop: actually-executed tool calls and observations, matching how the source
-dataset was generated via the Terminus-2 harness.
-
-If you later want a self-hosted teacher (vLLM/SGLang infra), the loop in
-`gemma4_31b_agent.py` ports cleanly: the Cerebras client is already
-OpenAI-compatible, so swapping to a local vLLM endpoint requires changing
-only the `base_url` and `api_key`.
-
----
-
-## Output: HuggingFace Bucket via `sync_bucket` (GCP EU CDN)
-
-The final 250K dataset is synced to a public HuggingFace Bucket through
-`huggingface_hub.sync_bucket`. The `hf buckets sync` commands below provide
-equivalent manual upload and download operations.
-
-**Bucket:** [`borntobeignored/OpenThoughts-Agents-SFT-250k`](https://huggingface.co/buckets/borntobeignored/OpenThoughts-Agents-SFT-250k)
-(CLI path: `hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k`)
-
-### CLI commands
+Resume every incomplete slot:
 
 ```bash
-# Install hf CLI (done automatically by install.sh)
-uv tool install hf
-
-# Upload local parquet shards to bucket
-hf buckets sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
-
-# Download bucket to local folder
-hf buckets sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
+uv run python stream_refinement_worker.py
 ```
 
-### What Stage 6 does
+Important options:
 
-1. Merges original 100K rows + ~150K validated synthetic rows
-2. Writes sharded parquet files to `~/pipeline/data/upload/`
-3. Runs `huggingface_hub.sync_bucket` to push all shards to the HF bucket
-4. Prints the download command on completion
-
-### Local intermediate data layout
-
-```
-~/pipeline/data/
-  tasks/                              # Stage 1 — task table (parquet)
-  variant_plan.parquet                # Stage 2 — 225K variant plan
-  raw_results/
-    trajectories.jsonl                # Stage 3 — raw synthetic conversations
-  validated/
-    validated_trajectories.parquet    # Stage 5 — filtered ~150K rows
-  upload/                             # Stage 6 — sharded parquet, ready to sync
+```text
+--original-source
+--output-dir
+--target-rows
+--model
+--concurrency
+--request-batch-size
+--max-attempts-per-run
+--limit
+--status-only
+--no-sync
 ```
 
-### Token permissions
+Local refinement state:
 
-HF token must have **write** access to the `borntobeignored` org bucket.
-Generate one at `huggingface.co/settings/tokens`.
+```text
+<data-dir>/refined/
+  accepted/
+    accepted-<content-id>.parquet
+  attempts.jsonl
+  progress.json
+```
+
+`attempts.jsonl` is an audit log. Successful resume state comes from validated
+accepted Parquet shards. A crash after an API response but before shard
+promotion may cause the assigned slot to be requested again, but it cannot
+create two stored successes for that slot.
+
+## Stage 6: exact publication
+
+Validate the complete local result without writing:
+
+```bash
+uv run python augment_150k_rows.py --dry-run --no-sync
+```
+
+Create and inspect a local publication:
+
+```bash
+uv run python augment_150k_rows.py --no-sync
+```
+
+Publish after local inspection:
+
+```bash
+uv run python augment_150k_rows.py
+```
+
+Important options:
+
+```text
+--original-source
+--refined-dir
+--upload-dir
+--hf-bucket
+--expected-new-rows
+--expected-total-rows
+--rows-per-shard
+--dry-run
+--no-sync
+```
+
+Local publication layout:
+
+```text
+<data-dir>/upload/
+  current.json
+  .work/                         # never synchronized
+  publications/
+    publication-<content-id>/
+      publication_manifest.json
+      data/
+        train-00000-of-00050.parquet
+        ...
+```
+
+Remote publication is versioned:
+
+```text
+hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k/
+  publications/publication-<content-id>/
+```
+
+Old local or remote shards are never mixed into a new publication.
+`--expected-total-rows` is an optional extra assertion; when omitted, the total
+is derived as the physical source count plus `--expected-new-rows`.
+
+## Verification
+
+Run the local suite:
+
+```bash
+.venv/bin/python -m unittest discover -v
+```
+
+Before the full paid run:
+
+1. Run all local tests.
+2. Run a generated 10K fixture through assignment, accepted-shard resume, and
+   Stage 6 publication.
+3. Repeat at 100K and 225K while recording wall time and peak RSS.
+4. Run one Gemini request with `--limit 1 --no-sync`.
+5. Inspect its source and refined conversations manually.
+6. Run a controlled 10–50 request pilot.
+7. Resume the full 150K slot assignment only after the pilot passes.
+
+Large generated fixtures belong under `/tmp` and must not be committed.
+
+### Verified synthetic scale results
+
+Measured under WSL on 2026-07-26 with 512-byte source-conversation fixture
+payloads. Peak RSS covers fixture creation, preflight, and publication in one
+process.
+
+| Accepted refinements | Source rows | Published rows | Peak RSS | Wall time |
+|---:|---:|---:|---:|---:|
+| 10,000 | 6,667 | 16,667 | 174 MiB | 5.3 s |
+| 100,000 | 66,667 | 166,667 | 269 MiB | 9.2 s |
+| 225,000 | 150,000 | 375,000 | 327 MiB | 17.6 s |
+
+These fixtures validate bounded control-state memory and exact row accounting;
+they do not predict Gemini latency or the final compressed size of real model
+outputs.
+
+## Legacy pipeline
+
+The following files describe the superseded 225K oversampling path and remain
+only for historical compatibility and comparison:
+
+- `extract_tasks.py`
+- `plan_variants.py`
+- `gemma4_31b_agent.py`
+- `gemini_trajectory_worker.py`
+- `validate_n_dedup.py`
+- `run_pilot.py`
+
+Do not start a new full run with those entry points. Existing raw JSONL data is
+left untouched so the migration remains reversible.

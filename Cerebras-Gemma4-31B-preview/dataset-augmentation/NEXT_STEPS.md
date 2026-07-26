@@ -1,5 +1,13 @@
 # Dataset augmentation: next steps and resume runbook
 
+> **Architecture update:** The 225,000-candidate oversampling workflow described
+> below has been superseded by `stream_refinement_worker.py`. The current path
+> assigns exactly 150,000 deterministic source-row refinement slots, retries a
+> rejected result for its original slot, and stores only the first accepted
+> result. See `README.md` for current commands. The historical details below are
+> retained as a record of the earlier design and must not be used to start a new
+> paid run.
+
 This document is the handoff point for a fresh Codex session. It records the
 authoritative pipeline state, the remaining implementation work, the required
 tests, and the safe order for resuming paid Gemini generation.
