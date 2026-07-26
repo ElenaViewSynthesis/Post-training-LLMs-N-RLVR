@@ -1,10 +1,10 @@
-"""
-Stage 6: Merge original 100K rows with accepted new synthetic rows, reshape
-them into the original schema (preserving the `conversations` column structure),
-and sync the final ~250K dataset with ``huggingface_hub.sync_bucket``.
+"""Stage 6: stream original and accepted refined rows into an exact publication.
 
-Upload path:
-    local sharded parquet → sync_bucket → hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
+The current path consumes immutable accepted shards produced by
+``stream_refinement_worker.py``.  It validates every refinement against its
+source row, writes into a fresh staging directory, verifies physical Parquet
+row counts and checksums, atomically promotes the completed local publication,
+and optionally synchronizes a versioned destination.
 
 Requires ``huggingface_hub`` with Bucket support (installed by this project).
 The equivalent manual CLI commands are:
@@ -13,10 +13,13 @@ Sync commands:
     Upload:   hf buckets sync ./data hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k
     Download: hf buckets sync hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k ./local
 
-Objective: OpenThoughts-Agent-SFT-100K → 250K total (100K original + 150K synthetic) by augmenting `conversations`.
+Objective: preserve every source row and add exactly 150K refinements.
 """
+import argparse
 from collections.abc import Mapping
+import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import dask
@@ -27,10 +30,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from huggingface_hub import sync_bucket
+from publication_pipeline import preflight_publication, write_local_publication
 
 load_dotenv()
 
-ORIGINAL_SRC  = "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet"
+DEFAULT_DATA_DIR = Path("~/pipeline/data")
+ORIGINAL_SRC = "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet"
 VALIDATED_PATH = Path("~/pipeline/data/validated/validated_trajectories.parquet").expanduser()
 TASKS_PATH     = Path("~/pipeline/data/tasks/").expanduser()
 UPLOAD_DIR     = Path("~/pipeline/data/upload").expanduser()
@@ -38,7 +43,74 @@ UPLOAD_DIR     = Path("~/pipeline/data/upload").expanduser()
 HF_BUCKET = "hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k"
 ROWS_PER_SHARD = 5_000
 EXPECTED_NEW_ROWS = 150_000
-EXPECTED_TOTAL_ROWS = 250_000
+EXPECTED_TOTAL_ROWS = 250_000  # Legacy helper default; the streaming CLI derives it.
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_data_dir = Path(
+        os.getenv("PIPELINE_DATA_DIR", str(DEFAULT_DATA_DIR))
+    ).expanduser()
+    parser = argparse.ArgumentParser(
+        description="Build an exact, versioned Stage 6 Parquet publication."
+    )
+    parser.add_argument("--data-dir", type=Path, default=default_data_dir)
+    parser.add_argument(
+        "--original-source",
+        default=os.getenv("ORIGINAL_DATASET_SOURCE", ORIGINAL_SRC),
+    )
+    parser.add_argument(
+        "--refined-dir",
+        type=Path,
+        help="Accepted refinement shards (default: <data-dir>/refined/accepted)",
+    )
+    parser.add_argument(
+        "--upload-dir",
+        type=Path,
+        help="Local publication root (default: <data-dir>/upload)",
+    )
+    parser.add_argument(
+        "--hf-bucket",
+        default=os.getenv("HF_PUBLICATION_BUCKET", HF_BUCKET),
+    )
+    parser.add_argument(
+        "--expected-new-rows",
+        type=_positive_int,
+        default=EXPECTED_NEW_ROWS,
+    )
+    parser.add_argument(
+        "--expected-total-rows",
+        type=_positive_int,
+        default=(
+            int(os.environ["EXPECTED_TOTAL_ROWS"])
+            if os.getenv("EXPECTED_TOTAL_ROWS")
+            else None
+        ),
+        help=(
+            "Optional fixed publication total. By default this is derived as "
+            "the physical source row count plus --expected-new-rows."
+        ),
+    )
+    parser.add_argument(
+        "--rows-per-shard",
+        type=_positive_int,
+        default=ROWS_PER_SHARD,
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-sync", action="store_true")
+    args = parser.parse_args(argv)
+    args.data_dir = args.data_dir.expanduser()
+    args.refined_dir = (
+        args.refined_dir or args.data_dir / "refined" / "accepted"
+    ).expanduser()
+    args.upload_dir = (args.upload_dir or args.data_dir / "upload").expanduser()
+    return args
 
 
 def normalize_conversations(value: Any) -> list[dict[str, str]]:
@@ -161,10 +233,20 @@ def require_exact_row_counts(
 
 def reshape_to_original_schema(validated: pd.DataFrame, tasks: pd.DataFrame, original_cols: list) -> pd.DataFrame:
     id_col = next((c for c in ("task_id", "id", "task", "run_id") if c in tasks.columns), tasks.columns[0])
+    if tasks[id_col].duplicated().any():
+        raise ValueError(f"task table contains duplicate {id_col} values")
+    if validated["variant_id"].duplicated().any():
+        raise ValueError("validated data contains duplicate variant_id values")
     task_lookup = {row[id_col]: row.to_dict() for _, row in tasks.iterrows()}
+    missing_tasks = sorted(set(validated["task_id"]).difference(task_lookup))
+    if missing_tasks:
+        raise ValueError(
+            f"validated data contains {len(missing_tasks)} missing task lookups; "
+            f"sample={missing_tasks[:3]}"
+        )
     rows = []
     for _, rec in validated.iterrows():
-        task = task_lookup.get(rec["task_id"], {})
+        task = task_lookup[rec["task_id"]]
         row = {col: task.get(col) for col in original_cols}
         row["conversations"] = normalize_conversations(rec["conversations"])
         row["run_id"] = rec["variant_id"]
@@ -175,61 +257,52 @@ def reshape_to_original_schema(validated: pd.DataFrame, tasks: pd.DataFrame, ori
     return pd.DataFrame(rows)
 
 
-def main():
-    # ── Load & merge ──────────────────────────────────────────────────────────
-    original_arrow_schema = read_original_arrow_schema(ORIGINAL_SRC)
-    output_arrow_schema = build_output_arrow_schema(original_arrow_schema)
-    original = dd.read_parquet(ORIGINAL_SRC)
-    original_cols = list(original.columns)
-    if original_cols != original_arrow_schema.names:
-        raise ValueError(
-            "Dask columns do not match the source Arrow schema: "
-            f"{original_cols} != {original_arrow_schema.names}"
-        )
-
-    validated = pd.read_parquet(VALIDATED_PATH)
-    expected_combined_count = require_exact_row_counts(len(original), len(validated))
-    tasks = dd.read_parquet(str(TASKS_PATH)).compute()
-
-    new_rows = reshape_to_original_schema(validated, tasks, original_cols)
-    new_ddf = dataframe_from_synthetic_rows(new_rows)
-
-    # Align columns — fill missing original columns with None
-    for col in original_cols:
-        if col not in new_ddf.columns:
-            new_ddf[col] = None
-    new_ddf = new_ddf[output_arrow_schema.names]
-    original = original.assign(is_synthetic_augmentation=False, source_task_id=None)
-
-    combined = dd.concat([original, new_ddf])[output_arrow_schema.names]
-    combined_count = len(combined)
-    if combined_count != expected_combined_count:
-        raise RuntimeError(
-            "Dask concatenation changed the expected row count: "
-            f"{combined_count:,} != {expected_combined_count:,}"
-        )
-    print(f"Combined row count: {combined_count:,}")
-
-    # ── Write sharded parquet to upload dir ───────────────────────────────────
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Writing sharded parquet to {UPLOAD_DIR} ...")
-    combined.to_parquet(
-        str(UPLOAD_DIR),
-        write_index=False,
-        engine="pyarrow",
-        schema=output_arrow_schema,
-        name_function=lambda i: f"train-{i:05d}-of-{combined.npartitions:05d}.parquet",
+def run(args: argparse.Namespace) -> int:
+    preflight = preflight_publication(
+        args.original_source,
+        args.refined_dir,
+        expected_new_rows=args.expected_new_rows,
+        expected_total_rows=args.expected_total_rows,
     )
-    shard_count = assert_output_arrow_schema(UPLOAD_DIR, output_arrow_schema)
-    print(f"Verified Arrow schema across {shard_count} parquet shards")
+    print(
+        f"Preflight: original={preflight.original_rows:,} "
+        f"synthetic={preflight.synthetic_rows:,} total={preflight.total_rows:,} "
+        f"publication={preflight.publication_id}"
+    )
+    if args.dry_run:
+        print("Dry run complete; no local or remote files were written.")
+        return 0
 
-    # ── Sync to HuggingFace Bucket ────────────────────────────────────────────
-    print(f"Syncing to {HF_BUCKET} ...")
-    sync_bucket(str(UPLOAD_DIR), HF_BUCKET)
+    publication_dir, created = write_local_publication(
+        preflight,
+        args.upload_dir,
+        rows_per_shard=args.rows_per_shard,
+    )
+    action = "Created" if created else "Reused"
+    print(f"{action} verified local publication: {publication_dir}")
+    if args.no_sync:
+        print("Remote synchronization disabled by --no-sync.")
+        return 0
 
-    print(f"Done. Bucket: {HF_BUCKET}")
-    print(f"Download with: hf buckets sync {HF_BUCKET} ./local")
+    destination = (
+        f"{args.hf_bucket.rstrip('/')}/publications/{preflight.publication_id}"
+    )
+    print(f"Synchronizing versioned publication to {destination} ...")
+    sync_bucket(str(publication_dir), destination)
+    print(f"Publication synchronization complete: {destination}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    here = Path(__file__).resolve().parent
+    load_dotenv(here / ".env", override=False)
+    load_dotenv(here.parent / ".env", override=False)
+    try:
+        return run(parse_args(argv))
+    except Exception as exc:  # noqa: BLE001 - CLI boundary must fail synchronization
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
