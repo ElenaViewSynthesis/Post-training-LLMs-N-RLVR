@@ -1,34 +1,8 @@
-"""Resume Stage 3 trajectory synthesis with the Gemini Developer API.
+"""Retired 225K candidate-generation worker.
 
-This worker is intentionally separate from ``gemma4_31b_agent.py`` so the
-existing Cerebras results remain untouched and no Cerebras client is imported
-or initialized.  It reads the same task/variant parquet files and appends the
-same JSONL record shape to ``trajectories.jsonl``.  A variant is complete only
-when an existing record for its ``variant_id`` has ``status == "ok"``; failed
-Cerebras or Gemini attempts are retried on the next run.
-
-The generated trajectories are structured synthesis, not live tool execution.
-Gemini emits simulated assistant/tool turns that are subsequently checked by
-``validate_n_dedup.py``.
-
-Examples:
-    # First verify one request, without syncing to Hugging Face.
-    uv run python gemini_trajectory_worker.py --limit 1 --no-sync
-
-    # Continue every variant that does not already have a successful result.
-    uv run python gemini_trajectory_worker.py
-
-Required environment:
-    GEMINI_API_KEY
-
-Optional environment:
-    PIPELINE_DATA_DIR        default: ~/pipeline/data
-    HF_RAW_RESULTS_BUCKET    default: hf://buckets/.../raw_results
-    GEMINI_MODEL_ID          default: gemini-3.6-flash
-    GEMINI_THINKING_LEVEL    default: medium
-    GEMINI_CONCURRENCY       default: 4
-    GEMINI_BATCH_SIZE        default: 60
-    GEMINI_MAX_OUTPUT_TOKENS default: 4096
+The importable helpers remain temporarily for compatibility tests and audit
+history, but executing this file exits before credentials or clients are
+loaded. Use ``stream_refinement_worker.py`` for assigned-slot refinement.
 """
 
 from __future__ import annotations
@@ -45,6 +19,14 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
+
+if __name__ == "__main__":
+    print(
+        "This 225K candidate-generation entry point is retired. "
+        "Use stream_refinement_worker.py for assigned-slot refinement.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 DEFAULT_DATA_DIR = Path("~/pipeline/data")
 DEFAULT_HF_BUCKET = (

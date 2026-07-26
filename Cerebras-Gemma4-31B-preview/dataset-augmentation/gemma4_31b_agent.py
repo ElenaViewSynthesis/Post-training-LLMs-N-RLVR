@@ -35,12 +35,21 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import sys
 
 import boto3
 import pandas as pd
 from dotenv import load_dotenv
 from huggingface_hub import sync_bucket
 from tqdm.asyncio import tqdm as atqdm
+
+if __name__ == "__main__":
+    print(
+        "This 225K oversampling entry point is retired. "
+        "Use stream_refinement_worker.py for deterministic source-row refinement.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -292,7 +301,3 @@ async def main():
     print(f"\nDone. ok={total_ok} err={total_err}  Results -> {out_path}")
     print("Final sync to HF bucket...")
     sync_to_hf()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
