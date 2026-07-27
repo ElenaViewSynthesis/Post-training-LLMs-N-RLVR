@@ -18,11 +18,14 @@ from refinement_pipeline import (
     SourceIdentity,
     build_augmented_schema,
     choose_secondary_source_ids,
-    iter_source_batches,
+    iter_source_batches_with_coordinates,
     load_source_identities,
     normalize_conversations,
     refinement_slots_for_source,
     scan_accepted_shards,
+    source_identity_digest,
+    source_identity_for_row,
+    source_schema_digest,
     stable_synthetic_id,
 )
 
@@ -38,6 +41,8 @@ class PublicationPreflight:
     total_rows: int
     accepted_shards: tuple[Path, ...]
     accepted_ids: frozenset[str]
+    source_identity_sha256: str
+    source_schema_sha256: str
     publication_id: str
 
 
@@ -55,10 +60,14 @@ def _publication_id(
     source_identities: dict[str, SourceIdentity],
     original_source: str,
     total_rows: int,
+    source_identity_sha256: str,
+    source_schema_sha256: str,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(f"source={original_source}\n".encode())
     digest.update(f"total={total_rows}\n".encode())
+    digest.update(f"source_identity_sha256={source_identity_sha256}\n".encode())
+    digest.update(f"source_schema_sha256={source_schema_sha256}\n".encode())
     for source_record_id, identity in sorted(source_identities.items()):
         digest.update(
             (
@@ -93,6 +102,9 @@ def validate_accepted_rows(
                 source_file = row.get("source_file")
                 source_row_index = row.get("source_row_index")
                 source_trial_name = row.get("source_trial_name")
+                source_conversation_sha256 = row.get(
+                    "source_conversation_fingerprint"
+                )
                 source_run_id = row.get("source_run_id")
                 source_task_id = row.get("source_task_id")
                 refinement_index = row.get("refinement_index")
@@ -102,6 +114,10 @@ def validate_accepted_rows(
                     or identity.source_file != source_file
                     or identity.source_row_index != source_row_index
                     or identity.source_trial_name != source_trial_name
+                    or (
+                        identity.source_conversation_fingerprint
+                        != source_conversation_sha256
+                    )
                     or identity.source_run_id != source_run_id
                     or identity.source_task_id != source_task_id
                     or row.get("task") != source_task_id
@@ -142,6 +158,8 @@ def preflight_publication(
     *,
     expected_new_rows: int,
     expected_total_rows: int | None = None,
+    expected_source_identity_sha256: str | None = None,
+    expected_source_schema_sha256: str | None = None,
 ) -> PublicationPreflight:
     original_schema, source_identities = load_source_identities(original_source)
     output_schema = build_augmented_schema(original_schema)
@@ -151,6 +169,20 @@ def preflight_publication(
         source_identities,
     )
     original_rows = len(source_identities)
+    source_identity_sha256 = source_identity_digest(source_identities.values())
+    source_schema_sha256 = source_schema_digest(original_schema)
+    if (
+        expected_source_identity_sha256 is not None
+        and source_identity_sha256 != expected_source_identity_sha256
+    ):
+        raise ValueError(
+            "source identities do not match the refinement source manifest"
+        )
+    if (
+        expected_source_schema_sha256 is not None
+        and source_schema_sha256 != expected_source_schema_sha256
+    ):
+        raise ValueError("source schema does not match the refinement source manifest")
     synthetic_rows = len(accepted_ids)
     total_rows = original_rows + synthetic_rows
     required_total_rows = (
@@ -195,12 +227,16 @@ def preflight_publication(
         total_rows=total_rows,
         accepted_shards=accepted_shards,
         accepted_ids=frozenset(accepted_ids),
+        source_identity_sha256=source_identity_sha256,
+        source_schema_sha256=source_schema_sha256,
         publication_id=_publication_id(
             accepted_ids,
             accepted_shards,
             source_identities,
             original_source,
             total_rows,
+            source_identity_sha256,
+            source_schema_sha256,
         ),
     )
 
@@ -219,6 +255,10 @@ def augment_original_batch(
             pa.nulls(row_count, type=output_schema.field("source_file").type),
             pa.nulls(row_count, type=output_schema.field("source_row_index").type),
             pa.nulls(row_count, type=output_schema.field("source_trial_name").type),
+            pa.nulls(
+                row_count,
+                type=output_schema.field("source_conversation_fingerprint").type,
+            ),
             pa.nulls(row_count, type=output_schema.field("source_task_id").type),
             pa.nulls(row_count, type=output_schema.field("source_run_id").type),
             pa.nulls(row_count, type=pa.int8()),
@@ -340,6 +380,8 @@ def _write_manifest(
         "original_rows": preflight.original_rows,
         "synthetic_rows": preflight.synthetic_rows,
         "total_rows": preflight.total_rows,
+        "source_identity_sha256": preflight.source_identity_sha256,
+        "source_schema_sha256": preflight.source_schema_sha256,
         "schema": preflight.output_schema.to_string(),
         "files": files,
     }
@@ -356,6 +398,8 @@ def _write_current_pointer(output_root: Path, preflight: PublicationPreflight) -
         "publication_id": preflight.publication_id,
         "path": f"publications/{preflight.publication_id}",
         "total_rows": preflight.total_rows,
+        "source_identity_sha256": preflight.source_identity_sha256,
+        "source_schema_sha256": preflight.source_schema_sha256,
     }
     temporary = output_root / ".current.json.tmp"
     temporary.write_text(
@@ -380,6 +424,8 @@ def validate_existing_publication(
         "original_rows": preflight.original_rows,
         "synthetic_rows": preflight.synthetic_rows,
         "total_rows": preflight.total_rows,
+        "source_identity_sha256": preflight.source_identity_sha256,
+        "source_schema_sha256": preflight.source_schema_sha256,
     }
     for key, expected in expected_manifest_values.items():
         if manifest.get(key) != expected:
@@ -439,10 +485,25 @@ def write_local_publication(
         rows_per_shard=rows_per_shard,
     )
     try:
-        for batch in iter_source_batches(preflight.original_source):
+        observed_source_identities: list[SourceIdentity] = []
+        for source_file, row_offset, batch in iter_source_batches_with_coordinates(
+            preflight.original_source
+        ):
+            observed_source_identities.extend(
+                source_identity_for_row(source_file, index, row)
+                for index, row in enumerate(
+                    batch.to_pylist(), start=row_offset
+                )
+            )
             writer.write_table(
                 augment_original_batch(batch, preflight.output_schema)
             )
+        observed_source_digest = source_identity_digest(observed_source_identities)
+        if (
+            len(observed_source_identities) != preflight.original_rows
+            or observed_source_digest != preflight.source_identity_sha256
+        ):
+            raise ValueError("source changed between publication preflight and write")
         for shard in preflight.accepted_shards:
             parquet_file = pq.ParquetFile(shard)
             for batch in parquet_file.iter_batches(batch_size=1_024):
