@@ -18,7 +18,9 @@ from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
     choose_secondary_source_ids,
+    ensure_source_manifest,
     load_source_identities,
+    load_source_manifest,
     refinement_slots_for_source,
     write_accepted_shard,
 )
@@ -73,7 +75,14 @@ def create_fixture(root: Path) -> tuple[Path, Path]:
         source_dir / "train-00001.parquet",
     )
 
-    _, identities = load_source_identities(str(source_dir))
+    source_schema, identities = load_source_identities(str(source_dir))
+    ensure_source_manifest(
+        accepted_dir.parent / "source_manifest.json",
+        requested_source=str(source_dir),
+        resolved_source=str(source_dir),
+        schema=source_schema,
+        identities=identities,
+    )
     by_trial_name = {
         identity.source_trial_name: identity for identity in identities.values()
     }
@@ -155,6 +164,10 @@ class PublicationPipelineTests(unittest.TestCase):
             self.assertEqual(physical_rows, 10)
             self.assertEqual(manifest["original_rows"], 4)
             self.assertEqual(manifest["synthetic_rows"], 6)
+            self.assertEqual(
+                manifest["source_identity_sha256"],
+                preflight.source_identity_sha256,
+            )
             self.assertEqual(current["publication_id"], preflight.publication_id)
             self.assertEqual(stale.read_bytes(), b"stale")
             self.assertNotIn(stale, data_shards)
@@ -173,6 +186,53 @@ class PublicationPipelineTests(unittest.TestCase):
             self.assertEqual(preflight.original_rows, 4)
             self.assertEqual(preflight.synthetic_rows, 6)
             self.assertEqual(preflight.total_rows, 10)
+
+    def test_preflight_rejects_a_source_manifest_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            manifest = load_source_manifest(
+                accepted_dir.parent / "source_manifest.json"
+            )
+
+            with self.assertRaisesRegex(ValueError, "source identities"):
+                preflight_publication(
+                    str(source_dir),
+                    accepted_dir,
+                    expected_new_rows=6,
+                    expected_source_identity_sha256="0" * 64,
+                    expected_source_schema_sha256=manifest.source_schema_sha256,
+                )
+
+    def test_source_change_after_preflight_is_not_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            upload_dir = root / "upload"
+            preflight = preflight_publication(
+                str(source_dir),
+                accepted_dir,
+                expected_new_rows=6,
+                expected_total_rows=10,
+            )
+            source_path = source_dir / "train-00000.parquet"
+            rows = pq.read_table(source_path).to_pylist()
+            rows[0]["conversations"][0]["content"] = "Changed after preflight"
+            pq.write_table(
+                pa.Table.from_pylist(rows, schema=SOURCE_SCHEMA), source_path
+            )
+
+            with self.assertRaisesRegex(ValueError, "source changed"):
+                write_local_publication(
+                    preflight,
+                    upload_dir,
+                    rows_per_shard=2,
+                )
+
+            self.assertFalse((upload_dir / "current.json").exists())
+            self.assertFalse(
+                (upload_dir / "publications" / preflight.publication_id).exists()
+            )
 
     def test_preflight_rejects_missing_source_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
