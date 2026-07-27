@@ -12,11 +12,24 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
-from refinement_pipeline import SourceIdentity, refinement_slots_for_source
+from refinement_pipeline import (
+    SourceIdentity,
+    build_augmented_schema,
+    build_refined_row,
+    load_source_identities,
+    refinement_slots_for_source,
+    scan_accepted_shards,
+    source_conversation_fingerprint,
+    write_accepted_shard,
+)
 from stream_refinement_worker import (
+    RefinementSyncError,
     Settings,
+    SlotResult,
     acquire_run_lock,
+    async_main,
     build_refinement_prompt,
     load_attempt_counts,
     parse_args,
@@ -59,14 +72,81 @@ def make_source_row(run_id: str, task: str) -> dict:
 
 
 def make_source_identity(run_id: str, task: str, row_index: int = 0) -> SourceIdentity:
+    row = make_source_row(run_id, task)
     return SourceIdentity(
         source_record_id=f"record-{row_index}-{run_id}",
         source_file="fixture/train.parquet",
         source_row_index=row_index,
         source_trial_name=run_id,
+        source_conversation_fingerprint=source_conversation_fingerprint(
+            row["conversations"]
+        ),
         source_run_id=run_id,
         source_task_id=task,
     )
+
+
+def write_source_fixture(root: Path, row_count: int = 1) -> Path:
+    source_dir = root / "source"
+    source_dir.mkdir()
+    rows = [make_source_row(f"source-{index}", f"task-{index}") for index in range(row_count)]
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=SOURCE_SCHEMA),
+        source_dir / "train-00000.parquet",
+    )
+    return source_dir
+
+
+def write_completed_fixture(source_dir: Path, output_dir: Path) -> None:
+    original_schema, identities = load_source_identities(str(source_dir))
+    identity = next(iter(identities.values()))
+    slot = refinement_slots_for_source(identity, frozenset())[0]
+    row = make_source_row(identity.source_run_id, identity.source_task_id)
+    accepted = build_refined_row(
+        row,
+        slot,
+        [
+            {"role": "user", "content": "Inspect the repository carefully"},
+            {"role": "assistant", "content": "Careful inspection complete"},
+        ],
+        original_schema,
+        model="test-model",
+        provider="gemini",
+    )
+    write_accepted_shard(
+        output_dir / "accepted",
+        [accepted],
+        build_augmented_schema(original_schema),
+    )
+
+
+def worker_args(source_dir: Path, output_dir: Path, target_rows: int) -> object:
+    return parse_args(
+        [
+            "--original-source",
+            str(source_dir),
+            "--output-dir",
+            str(output_dir),
+            "--target-rows",
+            str(target_rows),
+            "--model",
+            "test-model",
+            "--concurrency",
+            "2",
+            "--request-batch-size",
+            "4",
+            "--max-attempts-per-run",
+            "1",
+        ]
+    )
+
+
+class ClosingAsyncClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def settings(max_attempts: int = 3) -> Settings:
@@ -128,6 +208,299 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                     acquire_run_lock(output_dir)
             finally:
                 first.close()
+
+    async def test_sync_only_skips_source_and_gemini(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory) / "refined"
+            output_dir.mkdir()
+            (output_dir / "progress.json").write_text("{}\n", encoding="utf-8")
+            args = parse_args(
+                [
+                    "--output-dir",
+                    str(output_dir),
+                    "--hf-bucket",
+                    "hf://buckets/example/refined",
+                    "--sync-only",
+                ]
+            )
+            with (
+                mock.patch(
+                    "stream_refinement_worker.load_source_identities"
+                ) as load_source,
+                mock.patch("stream_refinement_worker.sync_output") as sync,
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client"
+                ) as create_client,
+            ):
+                exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 0)
+        sync.assert_called_once_with(output_dir, "hf://buckets/example/refined")
+        load_source.assert_not_called()
+        create_client.assert_not_called()
+
+    async def test_completed_startup_syncs_without_gemini(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            write_completed_fixture(source_dir, output_dir)
+            args = worker_args(source_dir, output_dir, target_rows=1)
+            with (
+                mock.patch("stream_refinement_worker.sync_output") as sync,
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client"
+                ) as create_client,
+            ):
+                exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 0)
+        sync.assert_called_once_with(output_dir, args.hf_bucket)
+        create_client.assert_not_called()
+
+    async def test_failed_completed_sync_can_be_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            write_completed_fixture(source_dir, output_dir)
+            args = worker_args(source_dir, output_dir, target_rows=1)
+            with (
+                mock.patch(
+                    "stream_refinement_worker.sync_output",
+                    side_effect=[RefinementSyncError("offline"), None],
+                ) as sync,
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client"
+                ) as create_client,
+            ):
+                with self.assertRaisesRegex(RefinementSyncError, "offline"):
+                    await async_main(args)
+                exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(sync.call_count, 2)
+        create_client.assert_not_called()
+
+    async def test_failed_final_sync_recovers_without_another_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            args = worker_args(source_dir, output_dir, target_rows=1)
+            client = ClosingAsyncClient()
+
+            async def accepted_result(
+                *call_args: object, **_: object
+            ) -> SlotResult:
+                source = call_args[1]
+                slot = call_args[2]
+                original_schema = call_args[3]
+                assert isinstance(source, dict)
+                return SlotResult(
+                    slot,
+                    build_refined_row(
+                        source,
+                        slot,
+                        [
+                            {"role": "user", "content": "Inspect carefully"},
+                            {
+                                "role": "assistant",
+                                "content": "Inspection complete",
+                            },
+                        ],
+                        original_schema,
+                        model="test-model",
+                        provider="gemini",
+                    ),
+                    [
+                        {
+                            "synthetic_id": slot.synthetic_id,
+                            "status": "accepted",
+                            "error_code": None,
+                        }
+                    ],
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ) as create_client,
+                mock.patch(
+                    "stream_refinement_worker.refine_slot",
+                    side_effect=accepted_result,
+                ) as refine,
+                mock.patch(
+                    "stream_refinement_worker.sync_output",
+                    side_effect=[RefinementSyncError("offline"), None],
+                ) as sync,
+            ):
+                with self.assertRaisesRegex(RefinementSyncError, "offline"):
+                    await async_main(args)
+                exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(client.closed)
+        self.assertEqual(create_client.call_count, 1)
+        self.assertEqual(refine.call_count, 1)
+        self.assertEqual(sync.call_count, 2)
+
+    async def test_fatal_batch_syncs_before_failure_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            args = worker_args(source_dir, output_dir, target_rows=1)
+            client = ClosingAsyncClient()
+
+            async def fatal_result(*call_args: object, **_: object) -> SlotResult:
+                slot = call_args[2]
+                assert hasattr(slot, "synthetic_id")
+                return SlotResult(
+                    slot,
+                    None,
+                    [
+                        {
+                            "synthetic_id": slot.synthetic_id,
+                            "status": "provider_error",
+                            "error_code": 401,
+                        }
+                    ],
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ),
+                mock.patch(
+                    "stream_refinement_worker.refine_slot",
+                    side_effect=fatal_result,
+                ),
+                mock.patch("stream_refinement_worker.sync_output") as sync,
+            ):
+                exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 2)
+        self.assertTrue(client.closed)
+        sync.assert_called_once_with(output_dir, args.hf_bucket)
+
+    async def test_fully_rejected_batch_syncs_before_failure_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            args = worker_args(source_dir, output_dir, target_rows=1)
+            client = ClosingAsyncClient()
+
+            async def rejected_result(*call_args: object, **_: object) -> SlotResult:
+                slot = call_args[2]
+                assert hasattr(slot, "synthetic_id")
+                return SlotResult(
+                    slot,
+                    None,
+                    [
+                        {
+                            "synthetic_id": slot.synthetic_id,
+                            "status": "rejected",
+                            "error_code": None,
+                        }
+                    ],
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ),
+                mock.patch(
+                    "stream_refinement_worker.refine_slot",
+                    side_effect=rejected_result,
+                ),
+                mock.patch("stream_refinement_worker.sync_output") as sync,
+            ):
+                exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 2)
+        self.assertTrue(client.closed)
+        sync.assert_called_once_with(output_dir, args.hf_bucket)
+
+    async def test_partial_batch_is_persisted_and_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root, row_count=2)
+            output_dir = root / "refined"
+            args = worker_args(source_dir, output_dir, target_rows=2)
+            client = ClosingAsyncClient()
+
+            async def partial_result(*call_args: object, **_: object) -> SlotResult:
+                source_row = call_args[1]
+                slot = call_args[2]
+                original_schema = call_args[3]
+                assert isinstance(source_row, dict)
+                if slot.source_row_index == 0:
+                    row = build_refined_row(
+                        source_row,
+                        slot,
+                        [
+                            {"role": "user", "content": "Inspect carefully"},
+                            {"role": "assistant", "content": "Inspection complete"},
+                        ],
+                        original_schema,
+                        model="test-model",
+                        provider="gemini",
+                    )
+                    return SlotResult(
+                        slot,
+                        row,
+                        [
+                            {
+                                "synthetic_id": slot.synthetic_id,
+                                "status": "accepted",
+                                "error_code": None,
+                            }
+                        ],
+                    )
+                return SlotResult(
+                    slot,
+                    None,
+                    [
+                        {
+                            "synthetic_id": slot.synthetic_id,
+                            "status": "rejected",
+                            "error_code": None,
+                        }
+                    ],
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ),
+                mock.patch(
+                    "stream_refinement_worker.refine_slot",
+                    side_effect=partial_result,
+                ),
+                mock.patch("stream_refinement_worker.sync_output") as sync,
+            ):
+                exit_code = await async_main(args)
+
+            schema = build_augmented_schema(SOURCE_SCHEMA)
+            completed, row_count = scan_accepted_shards(
+                output_dir / "accepted", schema
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(row_count, 1)
+        self.assertTrue(client.closed)
+        sync.assert_called_once_with(output_dir, args.hf_bucket)
 
     async def test_retries_rejected_result_for_the_same_slot(self) -> None:
         valid_output = json.dumps(
