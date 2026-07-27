@@ -17,9 +17,11 @@ from refinement_pipeline import (
     build_refined_row,
     choose_secondary_source_ids,
     conversation_fingerprint,
+    ensure_run_manifest,
     ensure_source_manifest,
     load_source_identities,
     load_source_manifest,
+    load_run_manifest,
     normalize_conversations,
     pin_source_revision,
     refinement_slots_for_source,
@@ -28,7 +30,10 @@ from refinement_pipeline import (
     source_identity_digest,
     stable_synthetic_id,
     validate_refinement_quality,
+    verify_refinement_state_inventory,
+    verify_source_manifest_content,
     write_accepted_shard,
+    write_refinement_state_inventory,
 )
 
 
@@ -292,6 +297,18 @@ class RefinementPipelineTests(unittest.TestCase):
                 ]
             )
 
+    def test_source_fingerprints_allow_long_original_trajectories(self) -> None:
+        source = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"turn-{index}",
+            }
+            for index in range(42)
+        ]
+        self.assertEqual(len(source_conversation_fingerprint(source)), 64)
+        with self.assertRaisesRegex(ValueError, "between 2 and 40"):
+            normalize_conversations(source)
+
     def test_loads_unique_source_identities_from_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             source_dir = Path(temporary_directory) / "source"
@@ -390,6 +407,160 @@ class RefinementPipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(load_source_manifest(path), written)
+            self.assertEqual(written.version, 2)
+            self.assertEqual(len(written.source_files), 1)
+            self.assertEqual(
+                written.source_files[0].path,
+                str(source_dir / "train-00000.parquet"),
+            )
+            self.assertEqual(len(written.source_content_sha256), 64)
+            verify_source_manifest_content(written)
+
+    def test_source_manifest_hashes_every_non_identity_column(self) -> None:
+        extended_schema = pa.schema(
+            [*SOURCE_SCHEMA, pa.field("source_note", pa.string())]
+        )
+        mutations = {
+            "model": "changed-model",
+            "model_provider": "changed-provider",
+            "source_note": "changed-note",
+        }
+        for field, replacement in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source_dir = root / "source"
+                source_dir.mkdir()
+                source_path = source_dir / "train-00000.parquet"
+                original = {**source_row("source-1"), "source_note": "original-note"}
+                pq.write_table(
+                    pa.Table.from_pylist([original], schema=extended_schema),
+                    source_path,
+                )
+                schema, identities = load_source_identities(str(source_dir))
+                manifest_path = root / "refined" / "source_manifest.json"
+                manifest = ensure_source_manifest(
+                    manifest_path,
+                    requested_source=str(source_dir),
+                    resolved_source=str(source_dir),
+                    schema=schema,
+                    identities=identities,
+                )
+
+                changed = dict(original)
+                changed[field] = replacement
+                pq.write_table(
+                    pa.Table.from_pylist([changed], schema=extended_schema),
+                    source_path,
+                )
+                changed_schema, changed_identities = load_source_identities(
+                    str(source_dir)
+                )
+
+                self.assertEqual(identities, changed_identities)
+                with self.assertRaisesRegex(ValueError, "immutable run manifest"):
+                    ensure_source_manifest(
+                        manifest_path,
+                        requested_source=str(source_dir),
+                        resolved_source=str(source_dir),
+                        schema=changed_schema,
+                        identities=changed_identities,
+                    )
+                with self.assertRaisesRegex(ValueError, "source files"):
+                    verify_source_manifest_content(manifest)
+
+    def test_run_manifests_are_unique_and_freeze_generation_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            pq.write_table(
+                pa.Table.from_pylist([source_row("source-1")], schema=SOURCE_SCHEMA),
+                source_dir / "train-00000.parquet",
+            )
+            schema, identities = load_source_identities(str(source_dir))
+            source_manifest = ensure_source_manifest(
+                root / "source_manifest.json",
+                requested_source=str(source_dir),
+                resolved_source=str(source_dir),
+                schema=schema,
+                identities=identities,
+            )
+            config = {
+                "concurrency": 2,
+                "request_batch_size": 4,
+                "max_output_tokens": 512,
+                "max_attempts_per_run": 3,
+                "timeout_seconds": 60,
+            }
+            first_path = root / "first" / "run_manifest.json"
+            second_path = root / "second" / "run_manifest.json"
+            first = ensure_run_manifest(
+                first_path,
+                source_manifest=source_manifest,
+                target_rows=1,
+                model="test-model",
+                generation_config=config,
+            )
+            second = ensure_run_manifest(
+                second_path,
+                source_manifest=source_manifest,
+                target_rows=1,
+                model="test-model",
+                generation_config=config,
+            )
+
+            self.assertNotEqual(first.run_instance_id, second.run_instance_id)
+            self.assertEqual(load_run_manifest(first_path), first)
+            with self.assertRaisesRegex(ValueError, "generation_config"):
+                ensure_run_manifest(
+                    first_path,
+                    source_manifest=source_manifest,
+                    target_rows=1,
+                    model="test-model",
+                    generation_config={**config, "max_output_tokens": 1024},
+                )
+
+    def test_state_inventory_rejects_changed_and_unexpected_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "source"
+            output_dir = root / "refined"
+            source_dir.mkdir()
+            pq.write_table(
+                pa.Table.from_pylist([source_row("source-1")], schema=SOURCE_SCHEMA),
+                source_dir / "train-00000.parquet",
+            )
+            schema, identities = load_source_identities(str(source_dir))
+            source_manifest = ensure_source_manifest(
+                output_dir / "source_manifest.json",
+                requested_source=str(source_dir),
+                resolved_source=str(source_dir),
+                schema=schema,
+                identities=identities,
+            )
+            ensure_run_manifest(
+                output_dir / "run_manifest.json",
+                source_manifest=source_manifest,
+                target_rows=1,
+                model="test-model",
+                generation_config={"max_output_tokens": 512},
+            )
+            write_refinement_state_inventory(output_dir)
+            verify_refinement_state_inventory(output_dir)
+
+            (output_dir / "source_manifest.json").write_text("{}\n")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                verify_refinement_state_inventory(output_dir)
+
+            ensure_source_manifest(
+                output_dir / "replacement-source-manifest.json",
+                requested_source=str(source_dir),
+                resolved_source=str(source_dir),
+                schema=schema,
+                identities=identities,
+            )
+            with self.assertRaisesRegex(ValueError, "unexpected refinement-state file"):
+                verify_refinement_state_inventory(output_dir)
 
     def test_physical_identity_distinguishes_repeated_logical_ids(self) -> None:
         first = source_row("shared-run", "task-a")

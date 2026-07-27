@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from refinement_pipeline import (
+    ASSIGNMENT_ALGORITHM_VERSION,
     RefinementSlot,
     REFINEMENT_VALIDATION_POLICY_VERSION,
     SourceIdentity,
@@ -33,16 +34,21 @@ from refinement_pipeline import (
     choose_secondary_source_ids,
     conversation_fingerprint,
     ensure_source_manifest,
+    ensure_run_manifest,
     iter_source_batches_with_coordinates,
     load_source_identities,
+    load_run_manifest,
     normalize_conversations,
     refinement_slots_for_source,
+    remote_run_destination,
     resolve_source_for_run,
     scan_accepted_shards,
     source_conversation_fingerprint,
     source_identity_for_row,
     validate_refinement_quality,
+    verify_refinement_state_inventory,
     write_accepted_shard,
+    write_refinement_state_inventory,
 )
 
 
@@ -230,6 +236,8 @@ def build_refinement_prompt(
         source_row["conversations"],
         require_nonempty_content=False,
         require_final_assistant=False,
+        min_turns=1,
+        max_turns=None,
     )
     serialized = json.dumps(
         source_conversation,
@@ -253,11 +261,19 @@ def attempt_seed(synthetic_id: str, attempt_number: int) -> int:
 
 
 def _safe_error(exc: Exception, api_key: str) -> tuple[str, int | None]:
-    code = getattr(exc, "code", None)
-    try:
-        code = int(code) if code is not None else None
-    except (TypeError, ValueError):
-        code = None
+    candidates = [
+        getattr(exc, "code", None),
+        getattr(exc, "status_code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+    ]
+    code = None
+    for candidate in candidates:
+        try:
+            if candidate is not None:
+                code = int(candidate)
+                break
+        except (TypeError, ValueError):
+            continue
     message = " ".join(str(exc).split())[:500]
     if api_key:
         message = message.replace(api_key, "[REDACTED]")
@@ -540,6 +556,8 @@ def preflight_source_rows(
                 row.get("conversations"),
                 require_nonempty_content=False,
                 require_final_assistant=False,
+                min_turns=1,
+                max_turns=None,
             )
             seen.add(observed.source_record_id)
     if seen != identities.keys():
@@ -578,14 +596,25 @@ def expected_synthetic_ids(
     }
 
 
-def sync_output(output_dir: Path, bucket: str) -> None:
+def sync_output(
+    output_dir: Path,
+    bucket: str,
+    *,
+    verify_hashes: bool = False,
+) -> None:
     from huggingface_hub import sync_bucket
 
     try:
-        sync_bucket(str(output_dir), bucket)
+        run_manifest = load_run_manifest(output_dir / "run_manifest.json")
+        verify_refinement_state_inventory(
+            output_dir,
+            verify_hashes=verify_hashes,
+        )
+        destination = remote_run_destination(bucket, run_manifest)
+        sync_bucket(str(output_dir), destination)
     except Exception as exc:
         raise RefinementSyncError(
-            f"failed to sync {output_dir} to {bucket}: {exc}"
+            f"failed to sync {output_dir} to the isolated run under {bucket}: {exc}"
         ) from exc
 
 
@@ -618,6 +647,8 @@ def write_progress_manifest(
     target_rows: int,
     completed_rows: int,
     model: str,
+    run_instance_id: str,
+    source_content_sha256: str,
 ) -> None:
     manifest = {
         "source": source,
@@ -626,7 +657,9 @@ def write_progress_manifest(
         "completed_rows": completed_rows,
         "remaining_rows": target_rows - completed_rows,
         "model": model,
-        "assignment": "one-per-source-plus-stable-secondary-subset",
+        "run_instance_id": run_instance_id,
+        "source_content_sha256": source_content_sha256,
+        "assignment": ASSIGNMENT_ALGORITHM_VERSION,
         "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -639,6 +672,16 @@ def write_progress_manifest(
     os.replace(temporary, destination)
 
 
+def generation_config_from_args(args: argparse.Namespace) -> dict[str, int]:
+    return {
+        "concurrency": args.concurrency,
+        "request_batch_size": args.request_batch_size,
+        "max_output_tokens": args.max_output_tokens,
+        "max_attempts_per_run": args.max_attempts_per_run,
+        "timeout_seconds": args.timeout_seconds,
+    }
+
+
 async def async_main(args: argparse.Namespace) -> int:
     if args.sync_only:
         if not args.output_dir.is_dir():
@@ -647,7 +690,7 @@ async def async_main(args: argparse.Namespace) -> int:
             )
         lock_stream = acquire_run_lock(args.output_dir)
         try:
-            sync_output(args.output_dir, args.hf_bucket)
+            sync_output(args.output_dir, args.hf_bucket, verify_hashes=True)
             print("Refinement-state synchronization complete.")
             return 0
         finally:
@@ -661,20 +704,49 @@ async def async_main(args: argparse.Namespace) -> int:
             source_manifest_path, args.original_source
         )
         original_schema, identities = load_source_identities(resolved_source)
-        ensure_source_manifest(
+        source_manifest = ensure_source_manifest(
             source_manifest_path,
             requested_source=args.original_source,
             resolved_source=resolved_source,
             schema=original_schema,
             identities=identities,
         )
+        run_manifest = ensure_run_manifest(
+            args.output_dir / "run_manifest.json",
+            source_manifest=source_manifest,
+            target_rows=args.target_rows,
+            model=args.model,
+            generation_config=generation_config_from_args(args),
+        )
+        inventory_path = args.output_dir / "checksum_inventory.json"
+        complete_path = args.output_dir / "complete.json"
+        if inventory_path.exists() != complete_path.exists():
+            raise ValueError(
+                "refinement state has an incomplete checksum inventory/complete marker"
+            )
+        if inventory_path.exists():
+            inventory_entries = verify_refinement_state_inventory(args.output_dir)
+        else:
+            preexisting_state = (
+                (args.output_dir / "progress.json").exists()
+                or (args.output_dir / "attempts.jsonl").exists()
+                or any((args.output_dir / "accepted").glob("accepted-*.parquet"))
+            )
+            if preexisting_state:
+                raise ValueError(
+                    "existing refinement state has no checksum inventory; "
+                    "legacy or partially restored state cannot be resumed"
+                )
+            inventory_entries = write_refinement_state_inventory(args.output_dir)
         secondary_source_ids = choose_secondary_source_ids(
             list(identities), args.target_rows
         )
         augmented_schema = build_augmented_schema(original_schema)
         accepted_dir = args.output_dir / "accepted"
         completed, accepted_rows, accepted_fingerprints = scan_accepted_shards(
-            accepted_dir, augmented_schema
+            accepted_dir,
+            augmented_schema,
+            expected_validation_policy=run_manifest.validation_policy_version,
         )
         expected_ids = expected_synthetic_ids(identities, secondary_source_ids)
         unexpected = completed.difference(expected_ids)
@@ -699,6 +771,13 @@ async def async_main(args: argparse.Namespace) -> int:
             target_rows=args.target_rows,
             completed_rows=len(completed),
             model=args.model,
+            run_instance_id=run_manifest.run_instance_id,
+            source_content_sha256=source_manifest.source_content_sha256,
+        )
+        inventory_entries = write_refinement_state_inventory(
+            args.output_dir,
+            previous_entries=inventory_entries,
+            changed_paths={"progress.json"},
         )
         if args.status_only:
             return 0
@@ -800,7 +879,7 @@ async def async_main(args: argparse.Namespace) -> int:
                             "request batch attempted to store an already accepted slot: "
                             f"{sorted(overlap)[:3]}"
                         )
-                    write_accepted_shard(
+                    accepted_shard = write_accepted_shard(
                         accepted_dir,
                         accepted_rows_batch,
                         augmented_schema,
@@ -808,6 +887,8 @@ async def async_main(args: argparse.Namespace) -> int:
                     shard_count += 1
                     completed.update(batch_ids)
                     accepted_fingerprints.update(new_fingerprints)
+                else:
+                    accepted_shard = None
                 all_attempts = [
                     attempt for result in results for attempt in result.attempts
                 ]
@@ -844,6 +925,18 @@ async def async_main(args: argparse.Namespace) -> int:
                     target_rows=args.target_rows,
                     completed_rows=len(completed),
                     model=args.model,
+                    run_instance_id=run_manifest.run_instance_id,
+                    source_content_sha256=source_manifest.source_content_sha256,
+                )
+                changed_state_paths = {"progress.json", "attempts.jsonl"}
+                if accepted_shard is not None:
+                    changed_state_paths.add(
+                        accepted_shard.relative_to(args.output_dir).as_posix()
+                    )
+                inventory_entries = write_refinement_state_inventory(
+                    args.output_dir,
+                    previous_entries=inventory_entries,
+                    changed_paths=changed_state_paths,
                 )
 
                 fatal_codes = {400, 401, 403, 404}

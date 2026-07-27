@@ -14,9 +14,10 @@ import os
 import re
 import string
 import tempfile
+import uuid
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ AUGMENTATION_FIELDS = {
     "source_task_id",
     "source_run_id",
     "refinement_index",
+    "refinement_validation_policy",
 }
 
 
@@ -83,6 +85,10 @@ class RefinementQualityIssue:
 
 
 REFINEMENT_VALIDATION_POLICY_VERSION = "quality-v1"
+ASSIGNMENT_ALGORITHM_VERSION = "source-slot-v1"
+SOURCE_MANIFEST_VERSION = 2
+RUN_MANIFEST_VERSION = 1
+STATE_INVENTORY_VERSION = 1
 
 # Calibrated against 173 locally available successful trajectories. Their
 # lowest rewritten-user source-token retention was 5.09%, and the lowest
@@ -165,11 +171,18 @@ def normalize_conversations(
     *,
     require_nonempty_content: bool = True,
     require_final_assistant: bool = True,
+    min_turns: int = 2,
+    max_turns: int | None = 40,
 ) -> list[dict[str, str]]:
     """Normalize a conversation without allowing Dask-style stringification."""
     turns = _list_like(value)
-    if not 2 <= len(turns) <= 40:
-        raise ValueError("conversations must contain between 2 and 40 turns")
+    if len(turns) < min_turns or (
+        max_turns is not None and len(turns) > max_turns
+    ):
+        maximum = str(max_turns) if max_turns is not None else "unbounded"
+        raise ValueError(
+            f"conversations must contain between {min_turns} and {maximum} turns"
+        )
 
     normalized: list[dict[str, str]] = []
     for index, turn in enumerate(turns):
@@ -211,6 +224,8 @@ def source_conversation_fingerprint(conversations: Any) -> str:
         conversations,
         require_nonempty_content=False,
         require_final_assistant=False,
+        min_turns=1,
+        max_turns=None,
     )
     canonical = json.dumps(
         normalized,
@@ -293,6 +308,8 @@ def validate_refinement_quality(
         source_conversations,
         require_nonempty_content=False,
         require_final_assistant=False,
+        min_turns=1,
+        max_turns=None,
     )
     candidate = normalize_conversations(
         candidate_conversations,
@@ -542,6 +559,66 @@ def pin_source_revision(source: str) -> str:
     return f"hf://datasets/{uri.id}@{revision}{suffix}"
 
 
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in string.hexdigits for character in value)
+    )
+
+
+def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with temporary.open("rb") as stream:
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+@dataclass(frozen=True)
+class SourceFileManifest:
+    path: str
+    size: int
+    sha256: str
+
+
+def source_content_digest(files: Sequence[SourceFileManifest]) -> str:
+    digest = hashlib.sha256(b"source-content-v1\n")
+    for source_file in files:
+        digest.update(
+            (
+                f"{source_file.path}\0{source_file.size}\0"
+                f"{source_file.sha256}\n"
+            ).encode()
+        )
+    return digest.hexdigest()
+
+
+def snapshot_source_files(source: str) -> tuple[SourceFileManifest, ...]:
+    """Hash every resolved Parquet byte so non-identity mutations are visible."""
+    filesystem, files = resolve_parquet_source(source)
+    snapshots: list[SourceFileManifest] = []
+    for source_path in sorted(str(path) for path in files):
+        digest = hashlib.sha256()
+        size = 0
+        with filesystem.open(source_path, "rb") as stream:
+            while chunk := stream.read(1_048_576):
+                digest.update(chunk)
+                size += len(chunk)
+        snapshots.append(
+            SourceFileManifest(
+                path=source_path,
+                size=size,
+                sha256=digest.hexdigest(),
+            )
+        )
+    return tuple(snapshots)
+
+
 @dataclass(frozen=True)
 class SourceManifest:
     version: int
@@ -550,6 +627,8 @@ class SourceManifest:
     source_rows: int
     source_identity_sha256: str
     source_schema_sha256: str
+    source_content_sha256: str
+    source_files: tuple[SourceFileManifest, ...]
 
 
 def load_source_manifest(path: Path) -> SourceManifest:
@@ -559,7 +638,26 @@ def load_source_manifest(path: Path) -> SourceManifest:
         raise ValueError(f"invalid source manifest: {path}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"source manifest is not an object: {path}")
+    if value.get("version") != SOURCE_MANIFEST_VERSION:
+        raise ValueError(
+            "legacy source manifest is unsupported; start a fresh refinement "
+            f"run with source manifest version {SOURCE_MANIFEST_VERSION}: {path}"
+        )
     try:
+        raw_files = value["source_files"]
+        if not isinstance(raw_files, list):
+            raise TypeError("source_files is not a list")
+        source_files = tuple(
+            SourceFileManifest(
+                path=item["path"],
+                size=item["size"],
+                sha256=item["sha256"],
+            )
+            for item in raw_files
+            if isinstance(item, dict)
+        )
+        if len(source_files) != len(raw_files):
+            raise TypeError("source_files contains a non-object")
         manifest = SourceManifest(
             version=value["version"],
             requested_source=value["requested_source"],
@@ -567,29 +665,35 @@ def load_source_manifest(path: Path) -> SourceManifest:
             source_rows=value["source_rows"],
             source_identity_sha256=value["source_identity_sha256"],
             source_schema_sha256=value["source_schema_sha256"],
+            source_content_sha256=value["source_content_sha256"],
+            source_files=source_files,
         )
-    except KeyError as exc:
-        raise ValueError(f"source manifest is missing {exc.args[0]!r}: {path}") from exc
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"source manifest is malformed: {path}") from exc
+    sorted_paths = sorted(source_file.path for source_file in manifest.source_files)
     if (
-        manifest.version != 1
-        or not isinstance(manifest.requested_source, str)
+        not isinstance(manifest.requested_source, str)
         or not manifest.requested_source
         or not isinstance(manifest.resolved_source, str)
         or not manifest.resolved_source
         or not isinstance(manifest.source_rows, int)
         or manifest.source_rows <= 0
-        or not isinstance(manifest.source_identity_sha256, str)
-        or len(manifest.source_identity_sha256) != 64
+        or not _is_sha256(manifest.source_identity_sha256)
+        or not _is_sha256(manifest.source_schema_sha256)
+        or not _is_sha256(manifest.source_content_sha256)
+        or not manifest.source_files
+        or [source_file.path for source_file in manifest.source_files] != sorted_paths
+        or len(sorted_paths) != len(set(sorted_paths))
         or any(
-            character not in string.hexdigits
-            for character in manifest.source_identity_sha256
+            not isinstance(source_file.path, str)
+            or not source_file.path.endswith(".parquet")
+            or not isinstance(source_file.size, int)
+            or source_file.size <= 0
+            or not _is_sha256(source_file.sha256)
+            for source_file in manifest.source_files
         )
-        or not isinstance(manifest.source_schema_sha256, str)
-        or len(manifest.source_schema_sha256) != 64
-        or any(
-            character not in string.hexdigits
-            for character in manifest.source_schema_sha256
-        )
+        or source_content_digest(manifest.source_files)
+        != manifest.source_content_sha256
     ):
         raise ValueError(f"source manifest contains invalid values: {path}")
     return manifest
@@ -619,13 +723,16 @@ def ensure_source_manifest(
     schema: pa.Schema,
     identities: Mapping[str, SourceIdentity],
 ) -> SourceManifest:
+    source_files = snapshot_source_files(resolved_source)
     manifest = SourceManifest(
-        version=1,
+        version=SOURCE_MANIFEST_VERSION,
         requested_source=requested_source,
         resolved_source=resolved_source,
         source_rows=len(identities),
         source_identity_sha256=source_identity_digest(identities.values()),
         source_schema_sha256=source_schema_digest(schema),
+        source_content_sha256=source_content_digest(source_files),
+        source_files=source_files,
     )
     if path.exists():
         existing = load_source_manifest(path)
@@ -633,16 +740,275 @@ def ensure_source_manifest(
             raise ValueError("source data does not match the immutable run manifest")
         return existing
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(manifest.__dict__, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    with temporary.open("rb") as stream:
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    _atomic_write_json(path, asdict(manifest))
     return manifest
+
+
+def verify_source_manifest_content(
+    manifest: SourceManifest, source: str | None = None
+) -> tuple[SourceFileManifest, ...]:
+    """Rehash a source and require byte-for-byte equality with its manifest."""
+    requested = source or manifest.resolved_source
+    snapshots = snapshot_source_files(requested)
+    if (
+        snapshots != manifest.source_files
+        or source_content_digest(snapshots) != manifest.source_content_sha256
+    ):
+        raise ValueError("source files do not match the immutable source manifest")
+    return snapshots
+
+
+@dataclass(frozen=True)
+class RunManifest:
+    version: int
+    run_instance_id: str
+    source_content_sha256: str
+    source_schema_sha256: str
+    target_rows: int
+    assignment_algorithm_version: str
+    model: str
+    generation_config: dict[str, int]
+    validation_policy_version: str
+
+
+def load_run_manifest(path: Path) -> RunManifest:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid run manifest: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"run manifest is not an object: {path}")
+    try:
+        manifest = RunManifest(
+            version=value["version"],
+            run_instance_id=value["run_instance_id"],
+            source_content_sha256=value["source_content_sha256"],
+            source_schema_sha256=value["source_schema_sha256"],
+            target_rows=value["target_rows"],
+            assignment_algorithm_version=value["assignment_algorithm_version"],
+            model=value["model"],
+            generation_config=value["generation_config"],
+            validation_policy_version=value["validation_policy_version"],
+        )
+    except KeyError as exc:
+        raise ValueError(f"run manifest is missing {exc.args[0]!r}: {path}") from exc
+    try:
+        uuid.UUID(manifest.run_instance_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"run manifest contains an invalid instance ID: {path}") from exc
+    if (
+        manifest.version != RUN_MANIFEST_VERSION
+        or not _is_sha256(manifest.source_content_sha256)
+        or not _is_sha256(manifest.source_schema_sha256)
+        or not isinstance(manifest.target_rows, int)
+        or manifest.target_rows <= 0
+        or manifest.assignment_algorithm_version != ASSIGNMENT_ALGORITHM_VERSION
+        or not isinstance(manifest.model, str)
+        or not manifest.model
+        or not isinstance(manifest.generation_config, dict)
+        or not manifest.generation_config
+        or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(config_value, int)
+            or config_value <= 0
+            for key, config_value in manifest.generation_config.items()
+        )
+        or manifest.validation_policy_version
+        != REFINEMENT_VALIDATION_POLICY_VERSION
+    ):
+        raise ValueError(f"run manifest contains invalid values: {path}")
+    return manifest
+
+
+def ensure_run_manifest(
+    path: Path,
+    *,
+    source_manifest: SourceManifest,
+    target_rows: int,
+    model: str,
+    generation_config: Mapping[str, int],
+) -> RunManifest:
+    expected_values = {
+        "source_content_sha256": source_manifest.source_content_sha256,
+        "source_schema_sha256": source_manifest.source_schema_sha256,
+        "target_rows": target_rows,
+        "assignment_algorithm_version": ASSIGNMENT_ALGORITHM_VERSION,
+        "model": model,
+        "generation_config": dict(generation_config),
+        "validation_policy_version": REFINEMENT_VALIDATION_POLICY_VERSION,
+    }
+    if path.exists():
+        existing = load_run_manifest(path)
+        for key, expected in expected_values.items():
+            if getattr(existing, key) != expected:
+                raise ValueError(
+                    f"run configuration conflicts with immutable {key}: "
+                    f"{getattr(existing, key)!r} != {expected!r}"
+                )
+        return existing
+
+    manifest = RunManifest(
+        version=RUN_MANIFEST_VERSION,
+        run_instance_id=str(uuid.uuid4()),
+        **expected_values,
+    )
+    _atomic_write_json(path, asdict(manifest))
+    return manifest
+
+
+def remote_run_destination(bucket: str, run_manifest: RunManifest) -> str:
+    if not isinstance(bucket, str) or not bucket.strip():
+        raise ValueError("remote refinement bucket must be a non-empty string")
+    return f"{bucket.rstrip('/')}/runs/{run_manifest.run_instance_id}"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1_048_576):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _managed_refinement_state_files(output_dir: Path) -> dict[str, Path]:
+    ignored = {"checksum_inventory.json", "complete.json"}
+    allowed_root = {
+        "source_manifest.json",
+        "run_manifest.json",
+        "progress.json",
+        "attempts.jsonl",
+    }
+    managed: dict[str, Path] = {}
+    if not output_dir.is_dir():
+        raise FileNotFoundError(f"refinement output directory does not exist: {output_dir}")
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(output_dir).as_posix()
+        if relative in ignored:
+            continue
+        if relative in allowed_root or (
+            relative.startswith("accepted/")
+            and path.name.startswith("accepted-")
+            and path.suffix == ".parquet"
+        ):
+            managed[relative] = path
+            continue
+        raise ValueError(f"unexpected refinement-state file: {relative}")
+    required = {"source_manifest.json", "run_manifest.json"}
+    missing = required.difference(managed)
+    if missing:
+        raise FileNotFoundError(
+            f"refinement state is missing required files: {sorted(missing)}"
+        )
+    return managed
+
+
+def write_refinement_state_inventory(
+    output_dir: Path,
+    *,
+    previous_entries: Mapping[str, Mapping[str, Any]] | None = None,
+    changed_paths: Iterable[str] = (),
+) -> dict[str, dict[str, Any]]:
+    """Atomically seal the files that make one restorable refinement state."""
+    run_manifest = load_run_manifest(output_dir / "run_manifest.json")
+    managed = _managed_refinement_state_files(output_dir)
+    changed = set(changed_paths)
+    entries: dict[str, dict[str, Any]] = {}
+    for relative, path in managed.items():
+        size = path.stat().st_size
+        previous = (previous_entries or {}).get(relative)
+        if (
+            relative not in changed
+            and isinstance(previous, Mapping)
+            and previous.get("size") == size
+            and _is_sha256(previous.get("sha256"))
+        ):
+            sha256 = str(previous["sha256"])
+        else:
+            sha256 = _file_sha256(path)
+        entries[relative] = {"path": relative, "size": size, "sha256": sha256}
+
+    inventory = {
+        "version": STATE_INVENTORY_VERSION,
+        "run_instance_id": run_manifest.run_instance_id,
+        "files": [entries[path] for path in sorted(entries)],
+    }
+    inventory_path = output_dir / "checksum_inventory.json"
+    _atomic_write_json(inventory_path, inventory)
+    inventory_sha256 = _file_sha256(inventory_path)
+    _atomic_write_json(
+        output_dir / "complete.json",
+        {
+            "version": STATE_INVENTORY_VERSION,
+            "run_instance_id": run_manifest.run_instance_id,
+            "inventory_sha256": inventory_sha256,
+            "file_count": len(entries),
+        },
+    )
+    return entries
+
+
+def verify_refinement_state_inventory(
+    output_dir: Path,
+    *,
+    verify_hashes: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Reject incomplete, changed, missing, or unexpected restored state."""
+    run_manifest = load_run_manifest(output_dir / "run_manifest.json")
+    inventory_path = output_dir / "checksum_inventory.json"
+    complete_path = output_dir / "complete.json"
+    try:
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("refinement state has no valid checksum inventory/complete marker") from exc
+    if not isinstance(inventory, dict) or not isinstance(complete, dict):
+        raise ValueError("refinement checksum inventory or complete marker is malformed")
+    if (
+        inventory.get("version") != STATE_INVENTORY_VERSION
+        or complete.get("version") != STATE_INVENTORY_VERSION
+        or inventory.get("run_instance_id") != run_manifest.run_instance_id
+        or complete.get("run_instance_id") != run_manifest.run_instance_id
+        or complete.get("inventory_sha256") != _file_sha256(inventory_path)
+    ):
+        raise ValueError("refinement checksum inventory does not match its complete marker")
+    raw_entries = inventory.get("files")
+    if not isinstance(raw_entries, list) or any(
+        not isinstance(entry, dict) for entry in raw_entries
+    ):
+        raise ValueError("refinement checksum inventory contains invalid file entries")
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in raw_entries:
+        relative = entry.get("path")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative in entries
+            or not isinstance(entry.get("size"), int)
+            or entry["size"] < 0
+            or not _is_sha256(entry.get("sha256"))
+        ):
+            raise ValueError("refinement checksum inventory contains an invalid entry")
+        entries[relative] = entry
+    managed = _managed_refinement_state_files(output_dir)
+    if set(managed) != set(entries):
+        missing = sorted(set(entries).difference(managed))[:3]
+        unexpected = sorted(set(managed).difference(entries))[:3]
+        raise ValueError(
+            "refinement state inventory file set mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    for relative, path in managed.items():
+        entry = entries[relative]
+        if path.stat().st_size != entry["size"] or (
+            verify_hashes and _file_sha256(path) != entry["sha256"]
+        ):
+            raise ValueError(f"refinement state checksum mismatch: {relative}")
+    if complete.get("file_count") != len(entries):
+        raise ValueError("refinement complete marker has an invalid file count")
+    return entries
 
 
 def choose_secondary_source_ids(
@@ -855,6 +1221,7 @@ def build_augmented_schema(original_schema: pa.Schema) -> pa.Schema:
                 nullable=True,
             ),
             pa.field("refinement_index", pa.int8(), nullable=True),
+            pa.field("refinement_validation_policy", pa.string(), nullable=True),
         ]
     )
 
@@ -903,11 +1270,15 @@ def build_refined_row(
     row["source_task_id"] = slot.source_task_id
     row["source_run_id"] = slot.source_run_id
     row["refinement_index"] = slot.refinement_index
+    row["refinement_validation_policy"] = REFINEMENT_VALIDATION_POLICY_VERSION
     return row
 
 
 def scan_accepted_shards(
-    accepted_dir: Path, expected_schema: pa.Schema
+    accepted_dir: Path,
+    expected_schema: pa.Schema,
+    *,
+    expected_validation_policy: str = REFINEMENT_VALIDATION_POLICY_VERSION,
 ) -> tuple[set[str], int, set[str]]:
     completed: set[str] = set()
     fingerprints: set[str] = set()
@@ -918,6 +1289,16 @@ def scan_accepted_shards(
     for shard in sorted(accepted_dir.glob("accepted-*.parquet")):
         actual = pq.read_schema(shard).remove_metadata()
         if not actual.equals(expected_schema, check_metadata=False):
+            required_metadata = {
+                "refined_conversation_fingerprint",
+                "refinement_validation_policy",
+            }
+            missing_metadata = required_metadata.difference(actual.names)
+            if missing_metadata:
+                raise ValueError(
+                    "legacy accepted shard is missing required refinement metadata "
+                    f"{sorted(missing_metadata)}: {shard}"
+                )
             raise TypeError(f"accepted shard schema mismatch: {shard}")
         parquet_file = pq.ParquetFile(shard)
         for batch in parquet_file.iter_batches(
@@ -926,6 +1307,7 @@ def scan_accepted_shards(
                 "run_id",
                 "conversations",
                 "refined_conversation_fingerprint",
+                "refinement_validation_policy",
             ],
         ):
             for row in batch.to_pylist():
@@ -939,6 +1321,11 @@ def scan_accepted_shards(
                         f"duplicate accepted synthetic ID: {synthetic_id}"
                     )
                 stored_fingerprint = row.get("refined_conversation_fingerprint")
+                if row.get("refinement_validation_policy") != expected_validation_policy:
+                    raise ValueError(
+                        "accepted validation policy does not match the run manifest "
+                        f"for {synthetic_id!r}"
+                    )
                 actual_fingerprint = conversation_fingerprint(
                     row.get("conversations")
                 )

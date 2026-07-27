@@ -20,16 +20,21 @@ from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
     conversation_fingerprint,
+    ensure_run_manifest,
+    ensure_source_manifest,
     load_source_identities,
+    load_run_manifest,
     refinement_slots_for_source,
     scan_accepted_shards,
     source_conversation_fingerprint,
     write_accepted_shard,
+    write_refinement_state_inventory,
 )
 from stream_refinement_worker import (
     RefinementSyncError,
     Settings,
     SlotResult,
+    _safe_error,
     acquire_run_lock,
     async_main,
     build_refinement_prompt,
@@ -37,6 +42,7 @@ from stream_refinement_worker import (
     parse_args,
     refine_slot,
     resolve_batch_conversation_collisions,
+    sync_output,
 )
 
 
@@ -102,6 +108,26 @@ def write_source_fixture(root: Path, row_count: int = 1) -> Path:
 
 def write_completed_fixture(source_dir: Path, output_dir: Path) -> None:
     original_schema, identities = load_source_identities(str(source_dir))
+    source_manifest = ensure_source_manifest(
+        output_dir / "source_manifest.json",
+        requested_source=str(source_dir),
+        resolved_source=str(source_dir),
+        schema=original_schema,
+        identities=identities,
+    )
+    ensure_run_manifest(
+        output_dir / "run_manifest.json",
+        source_manifest=source_manifest,
+        target_rows=1,
+        model="test-model",
+        generation_config={
+            "concurrency": 2,
+            "request_batch_size": 4,
+            "max_output_tokens": 4096,
+            "max_attempts_per_run": 1,
+            "timeout_seconds": 180,
+        },
+    )
     identity = next(iter(identities.values()))
     slot = refinement_slots_for_source(identity, frozenset())[0]
     row = make_source_row(identity.source_run_id, identity.source_task_id)
@@ -121,6 +147,7 @@ def write_completed_fixture(source_dir: Path, output_dir: Path) -> None:
         [accepted],
         build_augmented_schema(original_schema),
     )
+    write_refinement_state_inventory(output_dir)
 
 
 def worker_args(source_dir: Path, output_dir: Path, target_rows: int) -> object:
@@ -192,6 +219,43 @@ class TrackingInteractions:
 
 
 class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_status_code_marks_provider_configuration_errors_fatal(self) -> None:
+        class BadRequestError(Exception):
+            status_code = 400
+
+        class FailingInteractions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def create(self, **_: object) -> object:
+                self.calls += 1
+                raise BadRequestError("invalid secret-key")
+
+        interactions = FailingInteractions()
+        client = SimpleNamespace(interactions=interactions)
+        source = make_source_row("source-1", "task-a")
+        slot = refinement_slots_for_source(
+            make_source_identity("source-1", "task-a"), frozenset()
+        )[0]
+
+        result = await refine_slot(
+            client,
+            source,
+            slot,
+            SOURCE_SCHEMA,
+            settings(max_attempts=3),
+            "secret-key",
+            asyncio.Semaphore(1),
+            starting_attempt=0,
+        )
+
+        self.assertIsNone(result.accepted_row)
+        self.assertEqual(interactions.calls, 1)
+        self.assertEqual(result.attempts[0]["status"], "provider_error")
+        self.assertEqual(result.attempts[0]["error_code"], 400)
+        self.assertNotIn("secret-key", result.attempts[0]["error"])
+        self.assertEqual(_safe_error(BadRequestError("failed"), "")[1], 400)
+
     async def test_data_directory_controls_default_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_dir = Path(temporary_directory)
@@ -238,9 +302,114 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                 exit_code = await async_main(args)
 
         self.assertEqual(exit_code, 0)
-        sync.assert_called_once_with(output_dir, "hf://buckets/example/refined")
+        sync.assert_called_once_with(
+            output_dir,
+            "hf://buckets/example/refined",
+            verify_hashes=True,
+        )
         load_source.assert_not_called()
         create_client.assert_not_called()
+
+    async def test_fresh_runs_use_distinct_remote_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dirs = [root / "refined-a", root / "refined-b"]
+            for output_dir in output_dirs:
+                args = worker_args(source_dir, output_dir, target_rows=1)
+                args.status_only = True
+                self.assertEqual(await async_main(args), 0)
+
+            manifests = [
+                load_run_manifest(output_dir / "run_manifest.json")
+                for output_dir in output_dirs
+            ]
+            self.assertNotEqual(
+                manifests[0].run_instance_id,
+                manifests[1].run_instance_id,
+            )
+            with mock.patch("huggingface_hub.sync_bucket") as bucket_sync:
+                for output_dir in output_dirs:
+                    sync_output(
+                        output_dir,
+                        "hf://buckets/example/refined",
+                        verify_hashes=True,
+                    )
+
+            destinations = [call.args[1] for call in bucket_sync.call_args_list]
+            self.assertEqual(len(destinations), 2)
+            self.assertNotEqual(destinations[0], destinations[1])
+            self.assertTrue(
+                destinations[0].endswith(
+                    f"/runs/{manifests[0].run_instance_id}"
+                )
+            )
+            self.assertTrue(
+                destinations[1].endswith(
+                    f"/runs/{manifests[1].run_instance_id}"
+                )
+            )
+
+    async def test_sync_only_reuses_the_existing_run_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            status_args = worker_args(source_dir, output_dir, target_rows=1)
+            status_args.status_only = True
+            self.assertEqual(await async_main(status_args), 0)
+            run_manifest = load_run_manifest(output_dir / "run_manifest.json")
+            sync_args = parse_args(
+                [
+                    "--output-dir",
+                    str(output_dir),
+                    "--hf-bucket",
+                    "hf://buckets/example/refined",
+                    "--sync-only",
+                ]
+            )
+            with (
+                mock.patch("huggingface_hub.sync_bucket") as bucket_sync,
+                mock.patch(
+                    "stream_refinement_worker.load_source_identities"
+                ) as load_source,
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client"
+                ) as create_client,
+            ):
+                self.assertEqual(await async_main(sync_args), 0)
+
+            bucket_sync.assert_called_once_with(
+                str(output_dir),
+                "hf://buckets/example/refined/runs/"
+                f"{run_manifest.run_instance_id}",
+            )
+            load_source.assert_not_called()
+            create_client.assert_not_called()
+
+    async def test_source_content_is_reverified_before_gemini_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            status_args = worker_args(source_dir, output_dir, target_rows=1)
+            status_args.status_only = True
+            self.assertEqual(await async_main(status_args), 0)
+
+            source_path = source_dir / "train-00000.parquet"
+            rows = pq.read_table(source_path).to_pylist()
+            rows[0]["model_provider"] = "changed-provider"
+            pq.write_table(
+                pa.Table.from_pylist(rows, schema=SOURCE_SCHEMA),
+                source_path,
+            )
+            run_args = worker_args(source_dir, output_dir, target_rows=1)
+            with mock.patch(
+                "stream_refinement_worker.create_gemini_client"
+            ) as create_client:
+                with self.assertRaisesRegex(ValueError, "immutable run manifest"):
+                    await async_main(run_args)
+            create_client.assert_not_called()
 
     async def test_completed_startup_syncs_without_gemini(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
