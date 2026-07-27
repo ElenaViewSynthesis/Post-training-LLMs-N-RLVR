@@ -101,6 +101,34 @@ physical-row → (`trial_name`, `run_id`, `task`) identity map, then for
 complete source-row validation. Requests then run in bounded batches. Only the
 active request batch and one accepted output batch are held in memory.
 
+### Retry and failure classification
+
+Every attempt is recorded in `attempts.jsonl` with a status that determines
+whether its assigned slot may be retried:
+
+- `rejected` means the provider returned a response, but local validation did
+  not accept it. Validation failures include malformed JSON, a response that is
+  not an object, a missing or invalid `conversations` list, invalid roles or
+  non-string/empty content, fewer than 2 or more than 40 turns, a conversation
+  that does not end with an assistant turn, an unchanged copy of the source
+  conversation, or source/slot lineage that no longer matches. The worker
+  retries the same deterministic slot up to `--max-attempts-per-run`; a rejected
+  response never becomes an accepted row or a replacement candidate.
+- `provider_error` means the request failed at the API/client boundary rather
+  than failing conversation validation. Non-fatal provider errors may retry the
+  same slot within its configured attempt limit.
+- Provider errors with HTTP status `400`, `401`, `403`, or `404` are fatal.
+  These normally indicate an invalid request, credentials, permissions, model,
+  or endpoint configuration, so the worker stops retrying that slot immediately
+  instead of consuming additional paid attempts. After the concurrent batch is
+  persisted, the overall run performs its enabled final synchronization and
+  returns exit code `2`. A final-synchronization failure is instead surfaced as
+  exit code `1` by the CLI boundary.
+
+An attempt becomes `accepted` only after the generated conversation and its
+source relationship pass every validation check. The first accepted result
+permanently completes that slot.
+
 Check status without initializing Gemini:
 
 ```bash
