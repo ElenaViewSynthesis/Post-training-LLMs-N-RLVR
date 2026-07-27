@@ -49,8 +49,12 @@ execute them in a live sandbox.
 - Only one worker can own a refinement output directory.
 - Every paid request is assigned to a deterministic source row and slot.
 - A remote source URI is resolved to a full immutable dataset commit before
-  slot assignment, then recorded with source-identity and schema digests.
-- All source identities and conversations are checked before paid requests.
+  slot assignment. Source manifest v2 records the sorted Parquet paths, byte
+  sizes, full per-file SHA-256 values, aggregate content digest, source-identity
+  digest, and schema digest.
+- Complete source-file hashes are checked on every resume before paid requests,
+  during Stage 6 preflight, and again after originals are
+  streamed but before publication promotion.
 - Generated conversations must remain nested `{role, content}` records, contain
   2–40 non-empty turns, and end with an assistant turn.
 - The deterministic `quality-v1` gate rejects task drift, refusal-only output,
@@ -58,6 +62,12 @@ execute them in a live sandbox.
 - Normalized conversation fingerprints are unique across every accepted slot;
   collisions retry the losing assigned slot instead of creating duplicates.
 - Accepted rows use an explicit Arrow schema and atomic immutable shards.
+- Every output directory has an atomic `run_manifest.json` with a random UUID,
+  frozen source/configuration digests, target, assignment version, model, and
+  validation-policy version.
+- Refinement backups are sealed by a checksum inventory and complete marker,
+  then synchronized only to `runs/<run-instance-id>/`; a fresh output directory
+  cannot inherit shards from an earlier run.
 - Resume state is derived from accepted Parquet shards, not optimistic counters.
 - Every enabled worker run synchronizes in a finalization path, including fatal
   and incomplete batches; a completed rerun synchronizes without opening Gemini.
@@ -100,10 +110,11 @@ The data directory defaults to `~/pipeline/data`. In the current WSL setup,
 
 ## Stage 3–5: streaming refinement
 
-The source dataset is read twice before requests begin: first for the compact
-physical-row → (`trial_name`, `run_id`, `task`) identity map, then for
-complete source-row validation. Requests then run in bounded batches. Only the
-active request batch and one accepted output batch are held in memory.
+Before requests begin, the source is read for the compact physical-row →
+(`trial_name`, `run_id`, `task`) identity map, hashed byte-for-byte against the
+manifest, and read again for complete-row validation. Requests then run in
+bounded batches. Only the active request batch and one accepted output batch
+are held in memory.
 
 ### Retry and failure classification
 
@@ -194,6 +205,9 @@ Local refinement state:
   attempts.jsonl
   progress.json
   source_manifest.json
+  run_manifest.json
+  checksum_inventory.json
+  complete.json
 ```
 
 `attempts.jsonl` is an audit log. Successful resume state comes from validated
@@ -201,10 +215,24 @@ accepted Parquet shards. A crash after an API response but before shard
 promotion may cause the assigned slot to be requested again, but it cannot
 create two stored successes for that slot.
 
-`source_manifest.json` binds the run to its requested source, resolved immutable
-source, exact physical-row/conversation identity digest, and Arrow schema
-digest. Stage 6 refuses to publish accepted shards without this manifest or
-against a different source snapshot.
+`source_manifest.json` version 2 binds the run to its requested and resolved
+source, exact physical-row/conversation identity digest, Arrow schema digest,
+and the complete bytes of every sorted Parquet file. `run_manifest.json` binds
+those source digests to the random run instance, exact target, assignment
+algorithm, model/generation settings, and `quality-v1`. The checksum inventory
+and marker cover both manifests, progress/audit files, and every accepted
+shard. Resume, `--sync-only`, and Stage 6 reject missing, changed, or unexpected
+state instead of repairing or silently migrating it.
+
+Refinement backup destinations are isolated:
+
+```text
+<hf-refinement-bucket>/runs/<run-instance-id>/
+```
+
+Deleting and recreating a local output directory creates a different UUID and
+therefore a different remote prefix. `--sync-only` loads the existing manifest
+and reuses its original prefix.
 
 ## Stage 6: exact publication
 
@@ -265,6 +293,12 @@ Old local or remote shards are never mixed into a new publication.
 `--expected-total-rows` is an optional extra assertion; when omitted, the total
 is derived as the physical source count plus `--expected-new-rows`.
 
+Stage 6 requires current accepted-shard metadata. It recomputes normalized
+conversation fingerprints, enforces global uniqueness, verifies every row's
+`refinement_validation_policy` against the run manifest, and rejects legacy
+accepted schemas explicitly. Publication IDs, manifests, and `current.json`
+include the run UUID and full source-content digest.
+
 ## Verification
 
 Run the local suite:
@@ -294,14 +328,16 @@ process.
 
 | Accepted refinements | Source rows | Published rows | Peak RSS | Wall time |
 |---:|---:|---:|---:|---:|
-| 10,000 | 6,667 | 16,667 | 187 MiB | 8.6 s |
-| 100,000 | 66,667 | 166,667 | 312 MiB | 26.6 s |
-| 225,000 | 150,000 | 375,000 | 388 MiB | 48.7 s |
+| 10,000 | 6,667 | 16,667 | 187 MiB | 19.7 s |
+| 100,000 | 66,667 | 166,667 | 326 MiB | 41.4 s |
+| 225,000 | 150,000 | 375,000 | 390 MiB | 67.2 s |
 
 These fixtures include global fingerprint indexing and full fingerprint
-recomputation during Stage 6 preflight. They validate bounded control-state
-memory and exact row accounting; they do not predict Gemini latency or the
-final compressed size of real model outputs.
+recomputation during Stage 6 preflight, complete source-file hashing, run
+manifest validation, checksum-inventory sealing, and post-stream source
+verification. They validate bounded control-state memory and exact row
+accounting; they do not predict Gemini latency or the final compressed size of
+real model outputs.
 
 ## Legacy pipeline
 
