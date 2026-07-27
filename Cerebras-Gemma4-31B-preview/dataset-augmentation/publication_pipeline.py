@@ -18,6 +18,7 @@ from refinement_pipeline import (
     SourceIdentity,
     build_augmented_schema,
     choose_secondary_source_ids,
+    conversation_fingerprint,
     iter_source_batches_with_coordinates,
     load_source_identities,
     normalize_conversations,
@@ -89,7 +90,9 @@ def validate_accepted_rows(
     output_schema: pa.Schema,
     source_identities: dict[str, SourceIdentity],
 ) -> tuple[set[str], tuple[Path, ...]]:
-    accepted_ids, row_count = scan_accepted_shards(accepted_dir, output_schema)
+    accepted_ids, row_count, _accepted_fingerprints = scan_accepted_shards(
+        accepted_dir, output_schema
+    )
     shards = tuple(sorted(accepted_dir.glob("accepted-*.parquet")))
     checked_rows = 0
     for shard in shards:
@@ -104,6 +107,9 @@ def validate_accepted_rows(
                 source_trial_name = row.get("source_trial_name")
                 source_conversation_sha256 = row.get(
                     "source_conversation_fingerprint"
+                )
+                refined_conversation_sha256 = row.get(
+                    "refined_conversation_fingerprint"
                 )
                 source_run_id = row.get("source_run_id")
                 source_task_id = row.get("source_task_id")
@@ -144,7 +150,15 @@ def validate_accepted_rows(
                     raise ValueError(
                         f"synthetic augmentation flag is not true: {synthetic_id!r}"
                     )
-                normalize_conversations(row.get("conversations"))
+                conversations = normalize_conversations(row.get("conversations"))
+                if (
+                    conversation_fingerprint(conversations)
+                    != refined_conversation_sha256
+                ):
+                    raise ValueError(
+                        "refined conversation fingerprint mismatch for "
+                        f"{synthetic_id!r}"
+                    )
     if checked_rows != row_count:
         raise ValueError(
             f"accepted metadata count changed during validation: {checked_rows} != {row_count}"
@@ -258,6 +272,10 @@ def augment_original_batch(
             pa.nulls(
                 row_count,
                 type=output_schema.field("source_conversation_fingerprint").type,
+            ),
+            pa.nulls(
+                row_count,
+                type=output_schema.field("refined_conversation_fingerprint").type,
             ),
             pa.nulls(row_count, type=output_schema.field("source_task_id").type),
             pa.nulls(row_count, type=output_schema.field("source_run_id").type),

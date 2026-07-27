@@ -11,8 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import string
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,7 @@ AUGMENTATION_FIELDS = {
     "source_row_index",
     "source_trial_name",
     "source_conversation_fingerprint",
+    "refined_conversation_fingerprint",
     "source_task_id",
     "source_run_id",
     "refinement_index",
@@ -69,6 +72,80 @@ class RefinementSlot:
     source_task_id: str
     refinement_index: int
     synthetic_id: str
+
+
+@dataclass(frozen=True)
+class RefinementQualityIssue:
+    """One stable, machine-readable reason a candidate cannot be accepted."""
+
+    code: str
+    detail: str
+
+
+REFINEMENT_VALIDATION_POLICY_VERSION = "quality-v1"
+
+# Calibrated against 173 locally available successful trajectories. Their
+# lowest rewritten-user source-token retention was 5.09%, and the lowest
+# assistant/tool retention was 15.82%. The rounded-down floors remain
+# conservative while exact anchor loss is considered separately.
+MIN_LONG_TASK_TOKEN_RETENTION = 0.05
+MIN_EXECUTION_TASK_TOKEN_RETENTION = 0.15
+WEAK_TASK_RETENTION_FOR_ANCHOR_LOSS = 0.25
+
+_TASK_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+/#:@~-]*")
+_URL_PATTERN = re.compile(r"https?://[^\s`\"'<>]+", re.IGNORECASE)
+_PATH_PATTERN = re.compile(
+    r"(?<!\w)(?:~?/|\./|\.\./)[^\s`\"'<>(),;]+"
+)
+_BACKTICK_PATTERN = re.compile(r"`([^`\n]+)`")
+_QUOTED_PATTERN = re.compile(r'''(?<![A-Za-z])["']([^"'\n]{2,120})["']''')
+_CLI_FLAG_PATTERN = re.compile(r"(?<!\w)--[A-Za-z0-9][A-Za-z0-9-]*")
+_NUMBER_PATTERN = re.compile(r"(?<!\w)\d+(?:\.\d+)*(?!\w)")
+_REFUSAL_ONLY_PATTERN = re.compile(
+    r"\b(?:i(?:['’]m| am) sorry|i apologize|"
+    r"i (?:cannot|can't|won't|am unable to) "
+    r"(?:help|assist|comply|fulfill)|"
+    r"(?:cannot|can't|unable to) "
+    r"(?:complete|continue|proceed|perform|fulfill)|"
+    r"request cannot be fulfilled|as an ai|something went wrong|no solution)\b",
+    re.IGNORECASE,
+)
+_TASK_STOPWORDS = frozenset(
+    {
+        "and",
+        "are",
+        "but",
+        "can",
+        "could",
+        "does",
+        "for",
+        "from",
+        "have",
+        "how",
+        "into",
+        "its",
+        "may",
+        "not",
+        "please",
+        "should",
+        "that",
+        "the",
+        "their",
+        "then",
+        "this",
+        "use",
+        "using",
+        "want",
+        "when",
+        "where",
+        "which",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+    }
+)
 
 
 def _list_like(value: Any) -> list[Any]:
@@ -142,6 +219,241 @@ def source_conversation_fingerprint(conversations: Any) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _normalized_content_key(content: str) -> str:
+    return " ".join(content.casefold().split())
+
+
+def _task_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for match in _TASK_TOKEN_PATTERN.finditer(text):
+        token = match.group(0).casefold().strip(".,:;")
+        if len(token) >= 3 and token not in _TASK_STOPWORDS:
+            tokens.add(token)
+    return tokens
+
+
+def _task_token_sequence(text: str) -> list[str]:
+    return [
+        match.group(0).casefold().strip(".,:;")
+        for match in _TASK_TOKEN_PATTERN.finditer(text)
+        if len(match.group(0).strip(".,:;")) >= 2
+    ]
+
+
+def _task_anchors(text: str) -> set[str]:
+    """Extract exact, high-signal values whose complete loss suggests drift."""
+    anchors: set[str] = set()
+    for pattern in (
+        _URL_PATTERN,
+        _PATH_PATTERN,
+        _CLI_FLAG_PATTERN,
+        _NUMBER_PATTERN,
+    ):
+        anchors.update(
+            match.group(0).casefold().rstrip(".,:;")
+            for match in pattern.finditer(text)
+        )
+
+    quoted_values = [
+        match.group(1) for match in _BACKTICK_PATTERN.finditer(text)
+    ]
+    quoted_values.extend(
+        match.group(1) for match in _QUOTED_PATTERN.finditer(text)
+    )
+    for value in quoted_values:
+        normalized = _normalized_content_key(value).rstrip(".,:;")
+        if 2 <= len(normalized) <= 120:
+            anchors.add(normalized)
+
+    for match in _TASK_TOKEN_PATTERN.finditer(text):
+        raw = match.group(0).strip(".,:;")
+        if (
+            any(character in raw for character in "_./:@+-")
+            or any(character.isdigit() for character in raw)
+            or (any(character.isupper() for character in raw[1:]) and len(raw) >= 4)
+        ):
+            anchors.add(raw.casefold())
+    return {anchor for anchor in anchors if anchor}
+
+
+def validate_refinement_quality(
+    source_conversations: Any,
+    candidate_conversations: Any,
+) -> tuple[RefinementQualityIssue, ...]:
+    """Apply deterministic, side-effect-free acceptance checks.
+
+    Structural schema validation remains the responsibility of
+    :func:`normalize_conversations`. This validator covers semantic-preservation
+    proxies and trajectory-quality invariants that the JSON schema cannot
+    express.
+    """
+    source = normalize_conversations(
+        source_conversations,
+        require_nonempty_content=False,
+        require_final_assistant=False,
+    )
+    candidate = normalize_conversations(
+        candidate_conversations,
+        require_final_assistant=False,
+    )
+    issues: dict[str, RefinementQualityIssue] = {}
+
+    def reject(code: str, detail: str) -> None:
+        existing = issues.get(code)
+        if existing is None:
+            issues[code] = RefinementQualityIssue(code, detail)
+        elif detail not in existing.detail:
+            issues[code] = RefinementQualityIssue(
+                code,
+                f"{existing.detail}; {detail}",
+            )
+
+    roles = [turn["role"] for turn in candidate]
+    if "user" not in roles or "assistant" not in roles:
+        reject(
+            "missing_participant",
+            "candidate must contain at least one user and one assistant turn",
+        )
+    if candidate[-1]["role"] != "assistant":
+        reject(
+            "invalid_turn_order",
+            "candidate must end with an assistant interpretation or summary",
+        )
+
+    for index, role in enumerate(roles):
+        if role != "tool":
+            continue
+        previous = index - 1
+        while previous >= 0 and roles[previous] == "tool":
+            previous -= 1
+        following = index + 1
+        while following < len(roles) and roles[following] == "tool":
+            following += 1
+        if previous < 0 or roles[previous] != "assistant":
+            reject(
+                "orphan_tool",
+                f"tool block beginning near turn {index} has no assistant invocation",
+            )
+        if following >= len(roles) or roles[following] != "assistant":
+            reject(
+                "orphan_tool",
+                f"tool block ending near turn {index} has no assistant interpretation",
+            )
+
+    final_assistant = next(
+        (
+            turn["content"]
+            for turn in reversed(candidate)
+            if turn["role"] == "assistant"
+        ),
+        "",
+    )
+    if (
+        len(_task_token_sequence(final_assistant)) <= 80
+        and _REFUSAL_ONLY_PATTERN.search(final_assistant)
+    ):
+        reject(
+            "refusal_only",
+            "candidate ends in a refusal or generic failure",
+        )
+
+    content_keys = [
+        _normalized_content_key(turn["content"]) for turn in candidate
+    ]
+    repeated = Counter(content_keys)
+    if any(
+        left == right
+        for left, right in zip(content_keys, content_keys[1:], strict=False)
+    ):
+        reject("degenerate_content", "candidate repeats adjacent turn content")
+    if repeated and max(repeated.values()) >= 3:
+        reject("degenerate_content", "candidate repeats the same content three times")
+    if len(content_keys) >= 6 and len(repeated) / len(content_keys) < 0.5:
+        reject("degenerate_content", "candidate has insufficient turn diversity")
+
+    participant_text = "\n".join(
+        turn["content"]
+        for turn in candidate
+        if turn["role"] in {"user", "assistant"}
+    )
+    participant_tokens = _task_token_sequence(participant_text)
+    if len(participant_tokens) < 4 or len(participant_text.strip()) < 24:
+        reject("degenerate_content", "candidate contains too little task information")
+    if (
+        len(participant_tokens) >= 8
+        and len(set(participant_tokens)) / len(participant_tokens) < 0.25
+    ):
+        reject("degenerate_content", "candidate content is excessively repetitive")
+
+    source_task = "\n".join(
+        turn["content"] for turn in source if turn["role"] == "user"
+    )
+    candidate_task = "\n".join(
+        turn["content"] for turn in candidate if turn["role"] == "user"
+    )
+    candidate_execution = "\n".join(
+        turn["content"]
+        for turn in candidate
+        if turn["role"] in {"assistant", "tool"}
+    )
+    source_tokens = _task_tokens(source_task)
+    candidate_tokens = _task_tokens(candidate_task)
+    overlap_count = len(source_tokens.intersection(candidate_tokens))
+    retention = overlap_count / len(source_tokens) if source_tokens else 1.0
+    if source_tokens and (
+        overlap_count == 0
+        or (
+            len(source_tokens) >= 20
+            and retention < MIN_LONG_TASK_TOKEN_RETENTION
+        )
+    ):
+        reject(
+            "task_drift",
+            f"source-task token retention {retention:.3f} is below policy",
+        )
+
+    execution_tokens = _task_tokens(candidate_execution)
+    execution_retention = (
+        len(source_tokens.intersection(execution_tokens)) / len(source_tokens)
+        if source_tokens
+        else 1.0
+    )
+    if (
+        len(source_tokens) >= 5
+        and execution_retention < MIN_EXECUTION_TASK_TOKEN_RETENTION
+    ):
+        reject(
+            "task_drift",
+            "assistant/tool task-token retention "
+            f"{execution_retention:.3f} is below policy",
+        )
+
+    source_anchors = _task_anchors(source_task)
+    candidate_anchors = _task_anchors(
+        f"{candidate_task}\n{candidate_execution}"
+    )
+    retained_anchors = source_anchors.intersection(candidate_anchors)
+    if (
+        source_anchors
+        and not retained_anchors
+        and (
+            len(source_anchors) >= 2
+            or retention < WEAK_TASK_RETENTION_FOR_ANCHOR_LOSS
+        )
+    ):
+        reject(
+            "task_drift",
+            "candidate loses every required high-signal task anchor",
+        )
+
+    if candidate == source:
+        reject(
+            "unchanged_conversation",
+            "refined conversation is identical to the source conversation",
+        )
+    return tuple(issues.values())
 
 
 def stable_synthetic_id(source_record_id: str, refinement_index: int) -> str:
@@ -531,6 +843,7 @@ def build_augmented_schema(original_schema: pa.Schema) -> pa.Schema:
                 nullable=True,
             ),
             pa.field("source_conversation_fingerprint", pa.string(), nullable=True),
+            pa.field("refined_conversation_fingerprint", pa.string(), nullable=True),
             pa.field(
                 "source_task_id",
                 original_schema.field("task").type,
@@ -567,8 +880,9 @@ def build_refined_row(
     ):
         raise ValueError("refinement slot does not match the source conversation")
 
+    normalized_conversations = normalize_conversations(conversations)
     row = {name: source_row.get(name) for name in original_schema.names}
-    row["conversations"] = normalize_conversations(conversations)
+    row["conversations"] = normalized_conversations
     row["run_id"] = slot.synthetic_id
     row["trial_name"] = slot.synthetic_id
     if "model" in row:
@@ -583,6 +897,9 @@ def build_refined_row(
     row["source_conversation_fingerprint"] = (
         slot.source_conversation_fingerprint
     )
+    row["refined_conversation_fingerprint"] = conversation_fingerprint(
+        normalized_conversations
+    )
     row["source_task_id"] = slot.source_task_id
     row["source_run_id"] = slot.source_run_id
     row["refinement_index"] = slot.refinement_index
@@ -591,25 +908,54 @@ def build_refined_row(
 
 def scan_accepted_shards(
     accepted_dir: Path, expected_schema: pa.Schema
-) -> tuple[set[str], int]:
+) -> tuple[set[str], int, set[str]]:
     completed: set[str] = set()
+    fingerprints: set[str] = set()
     row_count = 0
     if not accepted_dir.exists():
-        return completed, row_count
+        return completed, row_count, fingerprints
 
     for shard in sorted(accepted_dir.glob("accepted-*.parquet")):
         actual = pq.read_schema(shard).remove_metadata()
         if not actual.equals(expected_schema, check_metadata=False):
             raise TypeError(f"accepted shard schema mismatch: {shard}")
-        table = pq.read_table(shard, columns=["run_id"])
-        for synthetic_id in table.column("run_id").to_pylist():
-            if not isinstance(synthetic_id, str) or not synthetic_id:
-                raise ValueError(f"accepted shard contains invalid run_id: {shard}")
-            if synthetic_id in completed:
-                raise ValueError(f"duplicate accepted synthetic ID: {synthetic_id}")
-            completed.add(synthetic_id)
-        row_count += table.num_rows
-    return completed, row_count
+        parquet_file = pq.ParquetFile(shard)
+        for batch in parquet_file.iter_batches(
+            batch_size=1_024,
+            columns=[
+                "run_id",
+                "conversations",
+                "refined_conversation_fingerprint",
+            ],
+        ):
+            for row in batch.to_pylist():
+                synthetic_id = row.get("run_id")
+                if not isinstance(synthetic_id, str) or not synthetic_id:
+                    raise ValueError(
+                        f"accepted shard contains invalid run_id: {shard}"
+                    )
+                if synthetic_id in completed:
+                    raise ValueError(
+                        f"duplicate accepted synthetic ID: {synthetic_id}"
+                    )
+                stored_fingerprint = row.get("refined_conversation_fingerprint")
+                actual_fingerprint = conversation_fingerprint(
+                    row.get("conversations")
+                )
+                if stored_fingerprint != actual_fingerprint:
+                    raise ValueError(
+                        "accepted conversation fingerprint mismatch for "
+                        f"{synthetic_id!r}"
+                    )
+                if actual_fingerprint in fingerprints:
+                    raise ValueError(
+                        "duplicate accepted conversation fingerprint: "
+                        f"{actual_fingerprint}"
+                    )
+                completed.add(synthetic_id)
+                fingerprints.add(actual_fingerprint)
+            row_count += batch.num_rows
+    return completed, row_count, fingerprints
 
 
 def write_accepted_shard(

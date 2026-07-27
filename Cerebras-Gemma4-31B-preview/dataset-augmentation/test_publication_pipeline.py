@@ -99,11 +99,17 @@ def create_fixture(root: Path) -> tuple[Path, Path]:
                     [
                         {
                             "role": "user",
-                            "content": f"Refine {row['task']} carefully",
+                            "content": (
+                                f"Refine {row['task']} carefully using approach "
+                                f"{slot.refinement_index}"
+                            ),
                         },
                         {
                             "role": "assistant",
-                            "content": f"Refined {row['task']} successfully",
+                            "content": (
+                                f"Refined {row['task']} successfully using approach "
+                                f"{slot.refinement_index}"
+                            ),
                         },
                     ],
                     SOURCE_SCHEMA,
@@ -263,6 +269,47 @@ class PublicationPipelineTests(unittest.TestCase):
             pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
 
             with self.assertRaisesRegex(ValueError, "source lookup"):
+                preflight_publication(
+                    str(source_dir),
+                    accepted_dir,
+                    expected_new_rows=6,
+                )
+
+    def test_preflight_recomputes_refined_conversation_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            shard = sorted(accepted_dir.glob("*.parquet"))[0]
+            table = pq.read_table(shard)
+            rows = table.to_pylist()
+            rows[0]["refined_conversation_fingerprint"] = "0" * 64
+            pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
+
+            with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
+                preflight_publication(
+                    str(source_dir),
+                    accepted_dir,
+                    expected_new_rows=6,
+                )
+
+    def test_preflight_rejects_duplicate_refined_conversations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            shards = sorted(accepted_dir.glob("*.parquet"))
+            first = pq.read_table(shards[0]).to_pylist()
+            second_table = pq.read_table(shards[1])
+            second = second_table.to_pylist()
+            second[0]["conversations"] = first[0]["conversations"]
+            second[0]["refined_conversation_fingerprint"] = first[0][
+                "refined_conversation_fingerprint"
+            ]
+            pq.write_table(
+                pa.Table.from_pylist(second, schema=second_table.schema),
+                shards[1],
+            )
+
+            with self.assertRaisesRegex(ValueError, "duplicate accepted conversation"):
                 preflight_publication(
                     str(source_dir),
                     accepted_dir,

@@ -53,6 +53,10 @@ execute them in a live sandbox.
 - All source identities and conversations are checked before paid requests.
 - Generated conversations must remain nested `{role, content}` records, contain
   2–40 non-empty turns, and end with an assistant turn.
+- The deterministic `quality-v1` gate rejects task drift, refusal-only output,
+  missing participants, orphaned tool blocks, and degenerate/repeated content.
+- Normalized conversation fingerprints are unique across every accepted slot;
+  collisions retry the losing assigned slot instead of creating duplicates.
 - Accepted rows use an explicit Arrow schema and atomic immutable shards.
 - Resume state is derived from accepted Parquet shards, not optimistic counters.
 - Every enabled worker run synchronizes in a finalization path, including fatal
@@ -114,6 +118,17 @@ whether its assigned slot may be retried:
   conversation, or source/slot lineage that no longer matches. The worker
   retries the same deterministic slot up to `--max-attempts-per-run`; a rejected
   response never becomes an accepted row or a replacement candidate.
+- Schema-valid candidates also pass the deterministic `quality-v1` policy. Its
+  long-task rewritten-user token floor is 5%, and its assistant/tool execution
+  floor is 15%. These conservative thresholds were rounded down from the
+  observed minima across 173 locally available successful trajectories (5.09%
+  and 15.82%, respectively). Complete loss of paths, identifiers, commands,
+  URLs, quoted values, and numbers is also rejected when lexical task retention
+  is weak.
+- Exact normalized conversation collisions are recorded as `rejected` with
+  `duplicate_conversation`. Existing accepted rows always win; within a
+  concurrent batch, the lexicographically smallest `synthetic_id` wins. Losing
+  slots are retried concurrently within their remaining per-run attempt budget.
 - `provider_error` means the request failed at the API/client boundary rather
   than failing conversation validation. Non-fatal provider errors may retry the
   same slot within its configured attempt limit.
@@ -126,8 +141,9 @@ whether its assigned slot may be retried:
   exit code `1` by the CLI boundary.
 
 An attempt becomes `accepted` only after the generated conversation and its
-source relationship pass every validation check. The first accepted result
-permanently completes that slot.
+source relationship pass every validation check and its computed
+`refined_conversation_fingerprint` is globally unique. The first accepted
+result permanently completes that slot.
 
 Check status without initializing Gemini:
 
@@ -272,19 +288,20 @@ Large generated fixtures belong under `/tmp` and must not be committed.
 
 ### Verified synthetic scale results
 
-Measured under WSL on 2026-07-26 with 512-byte source-conversation fixture
+Measured under WSL on 2026-07-27 with 512-byte source-conversation fixture
 payloads. Peak RSS covers fixture creation, preflight, and publication in one
 process.
 
 | Accepted refinements | Source rows | Published rows | Peak RSS | Wall time |
 |---:|---:|---:|---:|---:|
-| 10,000 | 6,667 | 16,667 | 187 MiB | 12.0 s |
-| 100,000 | 66,667 | 166,667 | 269 MiB | 9.2 s |
-| 225,000 | 150,000 | 375,000 | 327 MiB | 17.6 s |
+| 10,000 | 6,667 | 16,667 | 187 MiB | 8.6 s |
+| 100,000 | 66,667 | 166,667 | 312 MiB | 26.6 s |
+| 225,000 | 150,000 | 375,000 | 388 MiB | 48.7 s |
 
-These fixtures validate bounded control-state memory and exact row accounting;
-they do not predict Gemini latency or the final compressed size of real model
-outputs.
+These fixtures include global fingerprint indexing and full fingerprint
+recomputation during Stage 6 preflight. They validate bounded control-state
+memory and exact row accounting; they do not predict Gemini latency or the
+final compressed size of real model outputs.
 
 ## Legacy pipeline
 

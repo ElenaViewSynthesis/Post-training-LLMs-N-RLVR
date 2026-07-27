@@ -19,13 +19,14 @@ import json
 import os
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
 from refinement_pipeline import (
     RefinementSlot,
+    REFINEMENT_VALIDATION_POLICY_VERSION,
     SourceIdentity,
     build_augmented_schema,
     build_refined_row,
@@ -38,7 +39,9 @@ from refinement_pipeline import (
     refinement_slots_for_source,
     resolve_source_for_run,
     scan_accepted_shards,
+    source_conversation_fingerprint,
     source_identity_for_row,
+    validate_refinement_quality,
     write_accepted_shard,
 )
 
@@ -305,6 +308,7 @@ def _attempt_record(
     error_code: int | None = None,
     fingerprint: str | None = None,
     interaction_id: str | None = None,
+    rejection_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "synthetic_id": slot.synthetic_id,
@@ -324,6 +328,8 @@ def _attempt_record(
         "error_code": error_code,
         "conversation_fingerprint": fingerprint,
         "interaction_id": interaction_id,
+        "rejection_codes": rejection_codes or [],
+        "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
     }
 
 
@@ -336,13 +342,19 @@ async def refine_slot(
     api_key: str,
     semaphore: asyncio.Semaphore,
     starting_attempt: int,
+    attempt_budget: int | None = None,
 ) -> SlotResult:
     prompt = build_refinement_prompt(source_row, slot)
     attempts: list[dict[str, Any]] = []
     fatal_codes = {400, 401, 403, 404}
 
     async with semaphore:
-        for offset in range(settings.max_attempts_per_run):
+        max_attempts = (
+            settings.max_attempts_per_run
+            if attempt_budget is None
+            else attempt_budget
+        )
+        for offset in range(max_attempts):
             attempt_number = starting_attempt + offset + 1
             try:
                 interaction = await client.interactions.create(
@@ -373,16 +385,37 @@ async def refine_slot(
                 parsed = json.loads(raw)
                 if not isinstance(parsed, dict):
                     raise TypeError("Gemini response must be a JSON object")
-                conversations = normalize_conversations(parsed.get("conversations"))
-                source_conversations = normalize_conversations(
-                    source_row["conversations"],
-                    require_nonempty_content=False,
+                conversations = normalize_conversations(
+                    parsed.get("conversations"),
                     require_final_assistant=False,
                 )
-                if conversations == source_conversations:
-                    raise ValueError(
-                        "refined conversation is identical to the source conversation"
+                quality_issues = validate_refinement_quality(
+                    source_row["conversations"],
+                    conversations,
+                )
+                fingerprint = (
+                    source_conversation_fingerprint(conversations)
+                    if quality_issues
+                    else conversation_fingerprint(conversations)
+                )
+                if quality_issues:
+                    attempts.append(
+                        _attempt_record(
+                            slot,
+                            attempt_number,
+                            status="rejected",
+                            error="; ".join(
+                                f"{issue.code}: {issue.detail}"
+                                for issue in quality_issues
+                            ),
+                            fingerprint=fingerprint,
+                            interaction_id=getattr(interaction, "id", None),
+                            rejection_codes=[
+                                issue.code for issue in quality_issues
+                            ],
+                        )
                     )
+                    continue
                 refined_row = build_refined_row(
                     source_row,
                     slot,
@@ -396,7 +429,7 @@ async def refine_slot(
                         slot,
                         attempt_number,
                         status="accepted",
-                        fingerprint=conversation_fingerprint(conversations),
+                        fingerprint=fingerprint,
                         interaction_id=getattr(interaction, "id", None),
                     )
                 )
@@ -410,6 +443,11 @@ async def refine_slot(
                         status="rejected",
                         error=error,
                         error_code=code,
+                        rejection_codes=[
+                            "invalid_json"
+                            if isinstance(exc, json.JSONDecodeError)
+                            else "invalid_conversation"
+                        ],
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - provider error boundary
@@ -426,6 +464,59 @@ async def refine_slot(
                 if code in fatal_codes:
                     break
     return SlotResult(slot, None, attempts)
+
+
+def resolve_batch_conversation_collisions(
+    results: list[SlotResult],
+    existing_fingerprints: set[str],
+) -> tuple[set[str], set[str]]:
+    """Deterministically reject exact duplicates before shard promotion.
+
+    Existing accepted rows always win. Within a new concurrent batch, sorting
+    by synthetic ID makes the winner independent of request completion order.
+    """
+    claimed = set(existing_fingerprints)
+    accepted_fingerprints: set[str] = set()
+    duplicate_ids: set[str] = set()
+    candidates = sorted(
+        (result for result in results if result.accepted_row is not None),
+        key=lambda result: result.slot.synthetic_id,
+    )
+    for result in candidates:
+        assert result.accepted_row is not None
+        fingerprint = conversation_fingerprint(
+            result.accepted_row.get("conversations")
+        )
+        stored_fingerprint = result.accepted_row.get(
+            "refined_conversation_fingerprint"
+        )
+        if stored_fingerprint != fingerprint:
+            raise ValueError(
+                "candidate conversation fingerprint does not match its row: "
+                f"{result.slot.synthetic_id!r}"
+            )
+        if fingerprint not in claimed:
+            claimed.add(fingerprint)
+            accepted_fingerprints.add(fingerprint)
+            continue
+
+        if not result.attempts or result.attempts[-1].get("status") != "accepted":
+            raise ValueError(
+                "accepted candidate has no matching accepted attempt record: "
+                f"{result.slot.synthetic_id!r}"
+            )
+        attempt = result.attempts[-1]
+        attempt["status"] = "rejected"
+        attempt["error"] = (
+            "duplicate_conversation: normalized conversation fingerprint "
+            f"{fingerprint} is already accepted"
+        )
+        attempt["error_code"] = None
+        attempt["conversation_fingerprint"] = fingerprint
+        attempt["rejection_codes"] = ["duplicate_conversation"]
+        result.accepted_row = None
+        duplicate_ids.add(result.slot.synthetic_id)
+    return accepted_fingerprints, duplicate_ids
 
 
 def preflight_source_rows(
@@ -536,6 +627,7 @@ def write_progress_manifest(
         "remaining_rows": target_rows - completed_rows,
         "model": model,
         "assignment": "one-per-source-plus-stable-secondary-subset",
+        "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / "progress.json"
@@ -581,7 +673,7 @@ async def async_main(args: argparse.Namespace) -> int:
         )
         augmented_schema = build_augmented_schema(original_schema)
         accepted_dir = args.output_dir / "accepted"
-        completed, accepted_rows = scan_accepted_shards(
+        completed, accepted_rows, accepted_fingerprints = scan_accepted_shards(
             accepted_dir, augmented_schema
         )
         expected_ids = expected_synthetic_ids(identities, secondary_source_ids)
@@ -647,13 +739,26 @@ async def async_main(args: argparse.Namespace) -> int:
         )
         if args.limit is not None:
             pending = itertools.islice(pending, args.limit)
+        retry_queue: deque[tuple[dict[str, Any], RefinementSlot]] = deque()
+        attempts_used_this_run: Counter[str] = Counter()
 
         processed = accepted_this_run = failed_this_run = shard_count = 0
         forced_exit_code = 0
         try:
             while True:
-                request_batch = list(
-                    itertools.islice(pending, settings.request_batch_size)
+                request_batch: list[tuple[dict[str, Any], RefinementSlot]] = []
+                while retry_queue and len(request_batch) < settings.request_batch_size:
+                    source_row, slot = retry_queue.popleft()
+                    if (
+                        attempts_used_this_run[slot.synthetic_id]
+                        < settings.max_attempts_per_run
+                    ):
+                        request_batch.append((source_row, slot))
+                request_batch.extend(
+                    itertools.islice(
+                        pending,
+                        settings.request_batch_size - len(request_batch),
+                    )
                 )
                 if not request_batch:
                     break
@@ -668,8 +773,18 @@ async def async_main(args: argparse.Namespace) -> int:
                             api_key,
                             semaphore,
                             attempt_counts[slot.synthetic_id],
+                            attempt_budget=(
+                                settings.max_attempts_per_run
+                                - attempts_used_this_run[slot.synthetic_id]
+                            ),
                         )
                         for source_row, slot in request_batch
+                    )
+                )
+                new_fingerprints, duplicate_ids = (
+                    resolve_batch_conversation_collisions(
+                        results,
+                        accepted_fingerprints,
                     )
                 )
                 accepted_rows_batch = [
@@ -692,12 +807,25 @@ async def async_main(args: argparse.Namespace) -> int:
                     )
                     shard_count += 1
                     completed.update(batch_ids)
+                    accepted_fingerprints.update(new_fingerprints)
                 all_attempts = [
                     attempt for result in results for attempt in result.attempts
                 ]
                 append_attempts(attempts_path, all_attempts)
                 for attempt in all_attempts:
                     attempt_counts[attempt["synthetic_id"]] += 1
+                    attempts_used_this_run[attempt["synthetic_id"]] += 1
+
+                request_by_id = {
+                    slot.synthetic_id: (source_row, slot)
+                    for source_row, slot in request_batch
+                }
+                for synthetic_id in sorted(duplicate_ids):
+                    if (
+                        attempts_used_this_run[synthetic_id]
+                        < settings.max_attempts_per_run
+                    ):
+                        retry_queue.append(request_by_id[synthetic_id])
 
                 batch_accepted = len(accepted_rows_batch)
                 batch_failed = len(results) - batch_accepted
@@ -727,6 +855,12 @@ async def async_main(args: argparse.Namespace) -> int:
                     forced_exit_code = 2
                     break
                 if batch_accepted == 0:
+                    if retry_queue:
+                        print(
+                            "Retrying duplicate conversations for their assigned "
+                            "slots within the remaining attempt budget."
+                        )
+                        continue
                     print("Stopping because the entire request batch remained incomplete.")
                     forced_exit_code = 2
                     break

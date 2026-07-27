@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -18,6 +19,7 @@ from refinement_pipeline import (
     SourceIdentity,
     build_augmented_schema,
     build_refined_row,
+    conversation_fingerprint,
     load_source_identities,
     refinement_slots_for_source,
     scan_accepted_shards,
@@ -34,6 +36,7 @@ from stream_refinement_worker import (
     load_attempt_counts,
     parse_args,
     refine_slot,
+    resolve_batch_conversation_collisions,
 )
 
 
@@ -492,13 +495,14 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                 exit_code = await async_main(args)
 
             schema = build_augmented_schema(SOURCE_SCHEMA)
-            completed, row_count = scan_accepted_shards(
+            completed, row_count, fingerprints = scan_accepted_shards(
                 output_dir / "accepted", schema
             )
 
         self.assertEqual(exit_code, 2)
         self.assertEqual(len(completed), 1)
         self.assertEqual(row_count, 1)
+        self.assertEqual(len(fingerprints), 1)
         self.assertTrue(client.closed)
         sync.assert_called_once_with(output_dir, args.hf_bucket)
 
@@ -539,6 +543,226 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
             [attempt["attempt_number"] for attempt in result.attempts], [5, 6]
         )
         self.assertEqual(result.accepted_row["run_id"], slot.synthetic_id)
+
+    async def test_quality_rejection_codes_are_recorded(self) -> None:
+        refusal = json.dumps(
+            {
+                "conversations": [
+                    {"role": "user", "content": "Inspect the repository carefully"},
+                    {
+                        "role": "assistant",
+                        "content": "I am sorry, I cannot help with this request.",
+                    },
+                ]
+            }
+        )
+        drift = json.dumps(
+            {
+                "conversations": [
+                    {
+                        "role": "user",
+                        "content": "Write a detailed poem about flowers and summer rain.",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "Here is a complete poem about a bright garden.",
+                    },
+                ]
+            }
+        )
+        valid = json.dumps(
+            {
+                "conversations": [
+                    {"role": "user", "content": "Inspect the repository carefully"},
+                    {
+                        "role": "assistant",
+                        "content": "The repository inspection is complete and verified.",
+                    },
+                ]
+            }
+        )
+        interactions = SequenceInteractions([refusal, drift, valid])
+        slot = refinement_slots_for_source(
+            make_source_identity("source-1", "task-a"), frozenset()
+        )[0]
+
+        result = await refine_slot(
+            SimpleNamespace(interactions=interactions),
+            make_source_row("source-1", "task-a"),
+            slot,
+            SOURCE_SCHEMA,
+            settings(),
+            "secret-key",
+            asyncio.Semaphore(1),
+            starting_attempt=0,
+        )
+
+        self.assertIsNotNone(result.accepted_row)
+        self.assertEqual(result.attempts[0]["status"], "rejected")
+        self.assertEqual(result.attempts[0]["rejection_codes"], ["refusal_only"])
+        self.assertEqual(result.attempts[1]["status"], "rejected")
+        self.assertEqual(result.attempts[1]["rejection_codes"], ["task_drift"])
+        self.assertEqual(result.attempts[2]["status"], "accepted")
+
+    async def test_batch_duplicates_retry_the_losing_slot_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            args = worker_args(source_dir, output_dir, target_rows=2)
+            args.max_attempts_per_run = 2
+            client = ClosingAsyncClient()
+            calls: Counter[str] = Counter()
+
+            async def duplicate_then_unique(
+                *call_args: object, **_: object
+            ) -> SlotResult:
+                source = call_args[1]
+                slot = call_args[2]
+                original_schema = call_args[3]
+                starting_attempt = call_args[7]
+                assert isinstance(source, dict)
+                calls[slot.synthetic_id] += 1
+                if calls[slot.synthetic_id] == 1:
+                    conversations = [
+                        {
+                            "role": "user",
+                            "content": "Inspect the repository using the shared approach.",
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "The shared repository inspection is complete.",
+                        },
+                    ]
+                else:
+                    conversations = [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect the repository using the alternate approach "
+                                f"for {slot.synthetic_id}."
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "The alternate repository inspection is complete for "
+                                f"{slot.synthetic_id}."
+                            ),
+                        },
+                    ]
+                row = build_refined_row(
+                    source,
+                    slot,
+                    conversations,
+                    original_schema,
+                    model="test-model",
+                    provider="gemini",
+                )
+                return SlotResult(
+                    slot,
+                    row,
+                    [
+                        {
+                            "synthetic_id": slot.synthetic_id,
+                            "attempt_number": starting_attempt + 1,
+                            "status": "accepted",
+                            "error": None,
+                            "error_code": None,
+                            "conversation_fingerprint": conversation_fingerprint(
+                                conversations
+                            ),
+                            "rejection_codes": [],
+                        }
+                    ],
+                )
+
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ),
+                mock.patch(
+                    "stream_refinement_worker.refine_slot",
+                    side_effect=duplicate_then_unique,
+                ),
+                mock.patch("stream_refinement_worker.sync_output"),
+            ):
+                exit_code = await async_main(args)
+
+            schema = build_augmented_schema(SOURCE_SCHEMA)
+            completed, row_count, fingerprints = scan_accepted_shards(
+                output_dir / "accepted", schema
+            )
+            attempts = [
+                json.loads(line)
+                for line in (output_dir / "attempts.jsonl").read_text().splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(completed), 2)
+        self.assertEqual(row_count, 2)
+        self.assertEqual(len(fingerprints), 2)
+        self.assertEqual(sorted(calls.values()), [1, 2])
+        duplicate_attempts = [
+            attempt
+            for attempt in attempts
+            if attempt.get("rejection_codes") == ["duplicate_conversation"]
+        ]
+        self.assertEqual(len(duplicate_attempts), 1)
+        self.assertEqual(
+            duplicate_attempts[0]["synthetic_id"],
+            max(completed),
+        )
+        self.assertTrue(client.closed)
+
+    async def test_existing_fingerprint_rejects_a_new_candidate(self) -> None:
+        source = make_source_row("source-1", "task-a")
+        slot = refinement_slots_for_source(
+            make_source_identity("source-1", "task-a"), frozenset()
+        )[0]
+        conversations = [
+            {"role": "user", "content": "Inspect the repository carefully."},
+            {
+                "role": "assistant",
+                "content": "The careful repository inspection is complete.",
+            },
+        ]
+        row = build_refined_row(
+            source,
+            slot,
+            conversations,
+            SOURCE_SCHEMA,
+            model="test-model",
+            provider="gemini",
+        )
+        fingerprint = conversation_fingerprint(conversations)
+        result = SlotResult(
+            slot,
+            row,
+            [
+                {
+                    "synthetic_id": slot.synthetic_id,
+                    "status": "accepted",
+                    "error": None,
+                    "error_code": None,
+                    "conversation_fingerprint": fingerprint,
+                    "rejection_codes": [],
+                }
+            ],
+        )
+
+        accepted, duplicates = resolve_batch_conversation_collisions(
+            [result], {fingerprint}
+        )
+
+        self.assertEqual(accepted, set())
+        self.assertEqual(duplicates, {slot.synthetic_id})
+        self.assertIsNone(result.accepted_row)
+        self.assertEqual(
+            result.attempts[-1]["rejection_codes"], ["duplicate_conversation"]
+        )
 
     async def test_stops_slot_after_first_success(self) -> None:
         valid_output = json.dumps(

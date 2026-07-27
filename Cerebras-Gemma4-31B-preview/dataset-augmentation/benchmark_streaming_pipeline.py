@@ -150,11 +150,17 @@ def write_refinement_fixture(
                         [
                             {
                                 "role": "user",
-                                "content": f"Refine {source_row['task']}",
+                                "content": (
+                                    f"Refine {source_row['task']} using approach "
+                                    f"{slot.refinement_index}"
+                                ),
                             },
                             {
                                 "role": "assistant",
-                                "content": f"Refined {source_row['task']} successfully",
+                                "content": (
+                                    f"Refined {source_row['task']} successfully "
+                                    f"using approach {slot.refinement_index}"
+                                ),
                             },
                         ],
                         original_schema,
