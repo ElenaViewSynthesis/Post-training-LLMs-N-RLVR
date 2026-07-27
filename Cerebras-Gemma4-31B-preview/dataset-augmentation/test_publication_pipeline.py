@@ -18,11 +18,13 @@ from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
     choose_secondary_source_ids,
+    ensure_run_manifest,
     ensure_source_manifest,
     load_source_identities,
     load_source_manifest,
     refinement_slots_for_source,
     write_accepted_shard,
+    write_refinement_state_inventory,
 )
 
 
@@ -42,6 +44,7 @@ SOURCE_SCHEMA = pa.schema(
         pa.field("run_id", pa.string()),
         pa.field("task", pa.string()),
         pa.field("trial_name", pa.string()),
+        pa.field("source_note", pa.string()),
     ]
 )
 
@@ -58,6 +61,7 @@ def source_row(index: int) -> dict:
         "run_id": source_id,
         "task": f"task-{index}",
         "trial_name": source_id,
+        "source_note": f"note-{index}",
     }
 
 
@@ -76,12 +80,25 @@ def create_fixture(root: Path) -> tuple[Path, Path]:
     )
 
     source_schema, identities = load_source_identities(str(source_dir))
-    ensure_source_manifest(
+    source_manifest = ensure_source_manifest(
         accepted_dir.parent / "source_manifest.json",
         requested_source=str(source_dir),
         resolved_source=str(source_dir),
         schema=source_schema,
         identities=identities,
+    )
+    ensure_run_manifest(
+        accepted_dir.parent / "run_manifest.json",
+        source_manifest=source_manifest,
+        target_rows=6,
+        model="refiner-model",
+        generation_config={
+            "concurrency": 1,
+            "request_batch_size": 3,
+            "max_output_tokens": 1,
+            "max_attempts_per_run": 1,
+            "timeout_seconds": 1,
+        },
     )
     by_trial_name = {
         identity.source_trial_name: identity for identity in identities.values()
@@ -120,6 +137,7 @@ def create_fixture(root: Path) -> tuple[Path, Path]:
     output_schema = build_augmented_schema(SOURCE_SCHEMA)
     write_accepted_shard(accepted_dir, accepted_rows[:3], output_schema)
     write_accepted_shard(accepted_dir, accepted_rows[3:], output_schema)
+    write_refinement_state_inventory(accepted_dir.parent)
     return source_dir, accepted_dir
 
 
@@ -174,6 +192,16 @@ class PublicationPipelineTests(unittest.TestCase):
                 manifest["source_identity_sha256"],
                 preflight.source_identity_sha256,
             )
+            self.assertEqual(
+                manifest["source_content_sha256"],
+                preflight.source_content_sha256,
+            )
+            self.assertEqual(manifest["run_instance_id"], preflight.run_instance_id)
+            self.assertEqual(
+                manifest["validation_policy_version"],
+                preflight.validation_policy_version,
+            )
+            self.assertEqual(len(manifest["source_files"]), 2)
             self.assertEqual(current["publication_id"], preflight.publication_id)
             self.assertEqual(stale.read_bytes(), b"stale")
             self.assertNotIn(stale, data_shards)
@@ -210,6 +238,31 @@ class PublicationPipelineTests(unittest.TestCase):
                     expected_source_schema_sha256=manifest.source_schema_sha256,
                 )
 
+    def test_preflight_rejects_non_identity_source_mutations(self) -> None:
+        mutations = {
+            "model": "changed-model",
+            "model_provider": "changed-provider",
+            "source_note": "changed-note",
+        }
+        for field, replacement in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source_dir, accepted_dir = create_fixture(root)
+                source_path = source_dir / "train-00000.parquet"
+                rows = pq.read_table(source_path).to_pylist()
+                rows[0][field] = replacement
+                pq.write_table(
+                    pa.Table.from_pylist(rows, schema=SOURCE_SCHEMA),
+                    source_path,
+                )
+
+                with self.assertRaisesRegex(ValueError, "source files"):
+                    preflight_publication(
+                        str(source_dir),
+                        accepted_dir,
+                        expected_new_rows=6,
+                    )
+
     def test_source_change_after_preflight_is_not_promoted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -240,6 +293,86 @@ class PublicationPipelineTests(unittest.TestCase):
                 (upload_dir / "publications" / preflight.publication_id).exists()
             )
 
+    def test_non_identity_source_change_after_stream_is_not_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            upload_dir = root / "upload"
+            preflight = preflight_publication(
+                str(source_dir),
+                accepted_dir,
+                expected_new_rows=6,
+            )
+            source_path = source_dir / "train-00000.parquet"
+            rows = pq.read_table(source_path).to_pylist()
+            rows[0]["model"] = "changed-after-preflight"
+            pq.write_table(
+                pa.Table.from_pylist(rows, schema=SOURCE_SCHEMA),
+                source_path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "source content changed"):
+                write_local_publication(
+                    preflight,
+                    upload_dir,
+                    rows_per_shard=2,
+                )
+            self.assertFalse((upload_dir / "current.json").exists())
+
+    def test_preflight_rejects_validation_policy_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            shard = sorted(accepted_dir.glob("*.parquet"))[0]
+            table = pq.read_table(shard)
+            rows = table.to_pylist()
+            rows[0]["refinement_validation_policy"] = "quality-v0"
+            pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
+            write_refinement_state_inventory(accepted_dir.parent)
+
+            with self.assertRaisesRegex(ValueError, "validation policy"):
+                preflight_publication(
+                    str(source_dir),
+                    accepted_dir,
+                    expected_new_rows=6,
+                )
+
+    def test_preflight_rejects_run_source_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            run_manifest_path = accepted_dir.parent / "run_manifest.json"
+            run_manifest = json.loads(run_manifest_path.read_text())
+            run_manifest["source_content_sha256"] = "0" * 64
+            run_manifest_path.write_text(
+                json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            write_refinement_state_inventory(accepted_dir.parent)
+
+            with self.assertRaisesRegex(ValueError, "run manifest"):
+                preflight_publication(
+                    str(source_dir),
+                    accepted_dir,
+                    expected_new_rows=6,
+                )
+
+    def test_preflight_rejects_legacy_accepted_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            shard = sorted(accepted_dir.glob("*.parquet"))[0]
+            table = pq.read_table(shard).drop(["refinement_validation_policy"])
+            pq.write_table(table, shard)
+            write_refinement_state_inventory(accepted_dir.parent)
+
+            with self.assertRaisesRegex(ValueError, "legacy accepted shard"):
+                preflight_publication(
+                    str(source_dir),
+                    accepted_dir,
+                    expected_new_rows=6,
+                )
+
     def test_preflight_rejects_missing_source_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -249,6 +382,7 @@ class PublicationPipelineTests(unittest.TestCase):
             rows = table.to_pylist()
             rows[0]["source_run_id"] = "unknown-source"
             pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
+            write_refinement_state_inventory(accepted_dir.parent)
 
             with self.assertRaisesRegex(ValueError, "source lookup"):
                 preflight_publication(
@@ -267,6 +401,7 @@ class PublicationPipelineTests(unittest.TestCase):
             rows = table.to_pylist()
             rows[0]["task"] = "different-task"
             pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
+            write_refinement_state_inventory(accepted_dir.parent)
 
             with self.assertRaisesRegex(ValueError, "source lookup"):
                 preflight_publication(
@@ -284,6 +419,7 @@ class PublicationPipelineTests(unittest.TestCase):
             rows = table.to_pylist()
             rows[0]["refined_conversation_fingerprint"] = "0" * 64
             pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), shard)
+            write_refinement_state_inventory(accepted_dir.parent)
 
             with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
                 preflight_publication(
@@ -308,6 +444,7 @@ class PublicationPipelineTests(unittest.TestCase):
                 pa.Table.from_pylist(second, schema=second_table.schema),
                 shards[1],
             )
+            write_refinement_state_inventory(accepted_dir.parent)
 
             with self.assertRaisesRegex(ValueError, "duplicate accepted conversation"):
                 preflight_publication(

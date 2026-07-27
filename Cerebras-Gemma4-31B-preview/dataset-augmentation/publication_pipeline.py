@@ -15,19 +15,28 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from refinement_pipeline import (
+    REFINEMENT_VALIDATION_POLICY_VERSION,
+    RunManifest,
+    SourceFileManifest,
     SourceIdentity,
     build_augmented_schema,
     choose_secondary_source_ids,
     conversation_fingerprint,
     iter_source_batches_with_coordinates,
+    load_run_manifest,
     load_source_identities,
+    load_source_manifest,
     normalize_conversations,
     refinement_slots_for_source,
     scan_accepted_shards,
+    snapshot_source_files,
+    source_content_digest,
     source_identity_digest,
     source_identity_for_row,
     source_schema_digest,
     stable_synthetic_id,
+    verify_refinement_state_inventory,
+    verify_source_manifest_content,
 )
 
 
@@ -44,6 +53,10 @@ class PublicationPreflight:
     accepted_ids: frozenset[str]
     source_identity_sha256: str
     source_schema_sha256: str
+    source_content_sha256: str
+    source_files: tuple[SourceFileManifest, ...]
+    run_instance_id: str
+    validation_policy_version: str
     publication_id: str
 
 
@@ -63,12 +76,19 @@ def _publication_id(
     total_rows: int,
     source_identity_sha256: str,
     source_schema_sha256: str,
+    source_content_sha256: str,
+    run_manifest: RunManifest,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(f"source={original_source}\n".encode())
     digest.update(f"total={total_rows}\n".encode())
     digest.update(f"source_identity_sha256={source_identity_sha256}\n".encode())
     digest.update(f"source_schema_sha256={source_schema_sha256}\n".encode())
+    digest.update(f"source_content_sha256={source_content_sha256}\n".encode())
+    digest.update(f"run_instance_id={run_manifest.run_instance_id}\n".encode())
+    digest.update(
+        f"validation_policy={run_manifest.validation_policy_version}\n".encode()
+    )
     for source_record_id, identity in sorted(source_identities.items()):
         digest.update(
             (
@@ -89,9 +109,13 @@ def validate_accepted_rows(
     accepted_dir: Path,
     output_schema: pa.Schema,
     source_identities: dict[str, SourceIdentity],
+    *,
+    expected_validation_policy: str,
 ) -> tuple[set[str], tuple[Path, ...]]:
     accepted_ids, row_count, _accepted_fingerprints = scan_accepted_shards(
-        accepted_dir, output_schema
+        accepted_dir,
+        output_schema,
+        expected_validation_policy=expected_validation_policy,
     )
     shards = tuple(sorted(accepted_dir.glob("accepted-*.parquet")))
     checked_rows = 0
@@ -114,6 +138,14 @@ def validate_accepted_rows(
                 source_run_id = row.get("source_run_id")
                 source_task_id = row.get("source_task_id")
                 refinement_index = row.get("refinement_index")
+                if (
+                    row.get("refinement_validation_policy")
+                    != expected_validation_policy
+                ):
+                    raise ValueError(
+                        "accepted validation policy does not match the run manifest "
+                        f"for {synthetic_id!r}"
+                    )
                 identity = source_identities.get(source_record_id)
                 if (
                     identity is None
@@ -174,17 +206,45 @@ def preflight_publication(
     expected_total_rows: int | None = None,
     expected_source_identity_sha256: str | None = None,
     expected_source_schema_sha256: str | None = None,
+    expected_source_content_sha256: str | None = None,
 ) -> PublicationPreflight:
+    verify_refinement_state_inventory(accepted_dir.parent)
+    source_manifest = load_source_manifest(accepted_dir.parent / "source_manifest.json")
+    run_manifest = load_run_manifest(accepted_dir.parent / "run_manifest.json")
+    if original_source not in {
+        source_manifest.requested_source,
+        source_manifest.resolved_source,
+    }:
+        raise ValueError("publication source conflicts with the refinement manifest")
+    if (
+        run_manifest.source_content_sha256
+        != source_manifest.source_content_sha256
+        or run_manifest.source_schema_sha256 != source_manifest.source_schema_sha256
+    ):
+        raise ValueError("run manifest does not match the immutable source manifest")
+    if run_manifest.target_rows != expected_new_rows:
+        raise ValueError(
+            "publication synthetic target does not match the run manifest: "
+            f"{expected_new_rows:,} != {run_manifest.target_rows:,}"
+        )
+    if (
+        run_manifest.validation_policy_version
+        != REFINEMENT_VALIDATION_POLICY_VERSION
+    ):
+        raise ValueError("run manifest uses an unsupported validation policy")
+    source_files = verify_source_manifest_content(source_manifest, original_source)
     original_schema, source_identities = load_source_identities(original_source)
     output_schema = build_augmented_schema(original_schema)
     accepted_ids, accepted_shards = validate_accepted_rows(
         accepted_dir,
         output_schema,
         source_identities,
+        expected_validation_policy=run_manifest.validation_policy_version,
     )
     original_rows = len(source_identities)
     source_identity_sha256 = source_identity_digest(source_identities.values())
     source_schema_sha256 = source_schema_digest(original_schema)
+    source_content_sha256 = source_manifest.source_content_sha256
     if (
         expected_source_identity_sha256 is not None
         and source_identity_sha256 != expected_source_identity_sha256
@@ -197,6 +257,15 @@ def preflight_publication(
         and source_schema_sha256 != expected_source_schema_sha256
     ):
         raise ValueError("source schema does not match the refinement source manifest")
+    if source_schema_sha256 != source_manifest.source_schema_sha256:
+        raise ValueError("source schema does not match the refinement source manifest")
+    if source_identity_sha256 != source_manifest.source_identity_sha256:
+        raise ValueError("source identities do not match the refinement source manifest")
+    if (
+        expected_source_content_sha256 is not None
+        and source_content_sha256 != expected_source_content_sha256
+    ):
+        raise ValueError("source content does not match the refinement source manifest")
     synthetic_rows = len(accepted_ids)
     total_rows = original_rows + synthetic_rows
     required_total_rows = (
@@ -243,6 +312,10 @@ def preflight_publication(
         accepted_ids=frozenset(accepted_ids),
         source_identity_sha256=source_identity_sha256,
         source_schema_sha256=source_schema_sha256,
+        source_content_sha256=source_content_sha256,
+        source_files=source_files,
+        run_instance_id=run_manifest.run_instance_id,
+        validation_policy_version=run_manifest.validation_policy_version,
         publication_id=_publication_id(
             accepted_ids,
             accepted_shards,
@@ -251,6 +324,8 @@ def preflight_publication(
             total_rows,
             source_identity_sha256,
             source_schema_sha256,
+            source_content_sha256,
+            run_manifest,
         ),
     )
 
@@ -280,6 +355,10 @@ def augment_original_batch(
             pa.nulls(row_count, type=output_schema.field("source_task_id").type),
             pa.nulls(row_count, type=output_schema.field("source_run_id").type),
             pa.nulls(row_count, type=pa.int8()),
+            pa.nulls(
+                row_count,
+                type=output_schema.field("refinement_validation_policy").type,
+            ),
         ]
     )
     return pa.Table.from_arrays(arrays, schema=output_schema)
@@ -400,6 +479,17 @@ def _write_manifest(
         "total_rows": preflight.total_rows,
         "source_identity_sha256": preflight.source_identity_sha256,
         "source_schema_sha256": preflight.source_schema_sha256,
+        "source_content_sha256": preflight.source_content_sha256,
+        "source_files": [
+            {
+                "path": source_file.path,
+                "size": source_file.size,
+                "sha256": source_file.sha256,
+            }
+            for source_file in preflight.source_files
+        ],
+        "run_instance_id": preflight.run_instance_id,
+        "validation_policy_version": preflight.validation_policy_version,
         "schema": preflight.output_schema.to_string(),
         "files": files,
     }
@@ -418,6 +508,17 @@ def _write_current_pointer(output_root: Path, preflight: PublicationPreflight) -
         "total_rows": preflight.total_rows,
         "source_identity_sha256": preflight.source_identity_sha256,
         "source_schema_sha256": preflight.source_schema_sha256,
+        "source_content_sha256": preflight.source_content_sha256,
+        "source_files": [
+            {
+                "path": source_file.path,
+                "size": source_file.size,
+                "sha256": source_file.sha256,
+            }
+            for source_file in preflight.source_files
+        ],
+        "run_instance_id": preflight.run_instance_id,
+        "validation_policy_version": preflight.validation_policy_version,
     }
     temporary = output_root / ".current.json.tmp"
     temporary.write_text(
@@ -444,6 +545,17 @@ def validate_existing_publication(
         "total_rows": preflight.total_rows,
         "source_identity_sha256": preflight.source_identity_sha256,
         "source_schema_sha256": preflight.source_schema_sha256,
+        "source_content_sha256": preflight.source_content_sha256,
+        "source_files": [
+            {
+                "path": source_file.path,
+                "size": source_file.size,
+                "sha256": source_file.sha256,
+            }
+            for source_file in preflight.source_files
+        ],
+        "run_instance_id": preflight.run_instance_id,
+        "validation_policy_version": preflight.validation_policy_version,
     }
     for key, expected in expected_manifest_values.items():
         if manifest.get(key) != expected:
@@ -522,6 +634,15 @@ def write_local_publication(
             or observed_source_digest != preflight.source_identity_sha256
         ):
             raise ValueError("source changed between publication preflight and write")
+        observed_source_files = snapshot_source_files(preflight.original_source)
+        if (
+            observed_source_files != preflight.source_files
+            or source_content_digest(observed_source_files)
+            != preflight.source_content_sha256
+        ):
+            raise ValueError(
+                "source content changed between publication preflight and write"
+            )
         for shard in preflight.accepted_shards:
             parquet_file = pq.ParquetFile(shard)
             for batch in parquet_file.iter_batches(batch_size=1_024):

@@ -27,6 +27,7 @@ from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
     choose_secondary_source_ids,
+    ensure_run_manifest,
     ensure_source_manifest,
     iter_source_batches_with_coordinates,
     load_source_identities,
@@ -34,6 +35,7 @@ from refinement_pipeline import (
     refinement_slots_for_source,
     source_identity_for_row,
     write_accepted_shard,
+    write_refinement_state_inventory,
 )
 
 
@@ -127,12 +129,25 @@ def write_refinement_fixture(
     shard_rows: int,
 ) -> None:
     original_schema, identities = load_source_identities(str(source_dir))
-    ensure_source_manifest(
+    source_manifest = ensure_source_manifest(
         accepted_dir.parent / "source_manifest.json",
         requested_source=str(source_dir),
         resolved_source=str(source_dir),
         schema=original_schema,
         identities=identities,
+    )
+    ensure_run_manifest(
+        accepted_dir.parent / "run_manifest.json",
+        source_manifest=source_manifest,
+        target_rows=target_rows,
+        model="fixture-refiner",
+        generation_config={
+            "concurrency": 1,
+            "request_batch_size": shard_rows,
+            "max_output_tokens": 1,
+            "max_attempts_per_run": 1,
+            "timeout_seconds": 1,
+        },
     )
     secondary = choose_secondary_source_ids(list(identities), target_rows)
     output_schema = build_augmented_schema(original_schema)
@@ -173,6 +188,7 @@ def write_refinement_fixture(
                     buffer.clear()
     if buffer:
         write_accepted_shard(accepted_dir, buffer, output_schema)
+    write_refinement_state_inventory(accepted_dir.parent)
 
 
 def execute(root: Path, args: argparse.Namespace) -> dict:
@@ -217,6 +233,7 @@ def execute(root: Path, args: argparse.Namespace) -> dict:
             source_manifest.source_identity_sha256
         ),
         expected_source_schema_sha256=source_manifest.source_schema_sha256,
+        expected_source_content_sha256=source_manifest.source_content_sha256,
     )
     timings["preflight_seconds"] = time.perf_counter() - started
 

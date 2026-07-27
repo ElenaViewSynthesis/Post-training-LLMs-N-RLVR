@@ -278,6 +278,7 @@ def run(args: argparse.Namespace) -> int:
             source_manifest.source_identity_sha256
         ),
         expected_source_schema_sha256=source_manifest.source_schema_sha256,
+        expected_source_content_sha256=source_manifest.source_content_sha256,
     )
     print(
         f"Preflight: original={preflight.original_rows:,} "
