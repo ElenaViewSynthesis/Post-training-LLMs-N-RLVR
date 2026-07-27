@@ -31,10 +31,12 @@ from refinement_pipeline import (
     build_refined_row,
     choose_secondary_source_ids,
     conversation_fingerprint,
+    ensure_source_manifest,
     iter_source_batches_with_coordinates,
     load_source_identities,
     normalize_conversations,
     refinement_slots_for_source,
+    resolve_source_for_run,
     scan_accepted_shards,
     source_identity_for_row,
     write_accepted_shard,
@@ -186,13 +188,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("HF_REFINEMENT_BUCKET", DEFAULT_HF_BUCKET),
     )
     parser.add_argument("--limit", type=_positive_int)
-    parser.add_argument("--status-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--status-only", action="store_true")
+    mode.add_argument(
+        "--sync-only",
+        action="store_true",
+        help="Synchronize existing local refinement state without reading the source or initializing Gemini.",
+    )
     parser.add_argument("--no-sync", action="store_true")
     args = parser.parse_args(argv)
     args.data_dir = args.data_dir.expanduser()
     args.output_dir = (args.output_dir or args.data_dir / "refined").expanduser()
     if args.request_batch_size < args.concurrency:
         parser.error("--request-batch-size must be at least --concurrency")
+    if args.sync_only and args.no_sync:
+        parser.error("--sync-only cannot be combined with --no-sync")
+    if args.sync_only and args.limit is not None:
+        parser.error("--sync-only cannot be combined with --limit")
     return args
 
 
@@ -300,6 +312,9 @@ def _attempt_record(
         "source_file": slot.source_file,
         "source_row_index": slot.source_row_index,
         "source_trial_name": slot.source_trial_name,
+        "source_conversation_fingerprint": (
+            slot.source_conversation_fingerprint
+        ),
         "source_run_id": slot.source_run_id,
         "source_task_id": slot.source_task_id,
         "refinement_index": slot.refinement_index,
@@ -483,6 +498,27 @@ def sync_output(output_dir: Path, bucket: str) -> None:
         ) from exc
 
 
+def create_gemini_client(api_key: str, settings: Settings) -> Any:
+    """Create the provider client behind a small testable boundary."""
+    from google import genai
+
+    return genai.Client(
+        api_key=api_key,
+        http_options={
+            "api_version": "v1beta",
+            "timeout": settings.timeout_ms,
+            "retry_options": {
+                "attempts": 5,
+                "initial_delay": 1.0,
+                "max_delay": 32.0,
+                "exp_base": 2.0,
+                "jitter": 1.0,
+                "http_status_codes": [408, 429, 500, 502, 503, 504],
+            },
+        },
+    )
+
+
 def write_progress_manifest(
     output_dir: Path,
     *,
@@ -512,10 +548,34 @@ def write_progress_manifest(
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    if args.sync_only:
+        if not args.output_dir.is_dir():
+            raise FileNotFoundError(
+                f"refinement output directory does not exist: {args.output_dir}"
+            )
+        lock_stream = acquire_run_lock(args.output_dir)
+        try:
+            sync_output(args.output_dir, args.hf_bucket)
+            print("Refinement-state synchronization complete.")
+            return 0
+        finally:
+            lock_stream.close()
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     lock_stream = acquire_run_lock(args.output_dir)
     try:
-        original_schema, identities = load_source_identities(args.original_source)
+        source_manifest_path = args.output_dir / "source_manifest.json"
+        resolved_source = resolve_source_for_run(
+            source_manifest_path, args.original_source
+        )
+        original_schema, identities = load_source_identities(resolved_source)
+        ensure_source_manifest(
+            source_manifest_path,
+            requested_source=args.original_source,
+            resolved_source=resolved_source,
+            schema=original_schema,
+            identities=identities,
+        )
         secondary_source_ids = choose_secondary_source_ids(
             list(identities), args.target_rows
         )
@@ -542,24 +602,29 @@ async def async_main(args: argparse.Namespace) -> int:
         )
         write_progress_manifest(
             args.output_dir,
-            source=args.original_source,
+            source=resolved_source,
             source_rows=len(identities),
             target_rows=args.target_rows,
             completed_rows=len(completed),
             model=args.model,
         )
-        if args.status_only or remaining == 0:
+        if args.status_only:
+            return 0
+        if remaining == 0:
+            if not args.no_sync:
+                sync_output(args.output_dir, args.hf_bucket)
+                print("Completed refinement state synchronized.")
+            else:
+                print("Refinement is complete; synchronization disabled by --no-sync.")
             return 0
 
-        checked_rows = preflight_source_rows(args.original_source, identities)
+        checked_rows = preflight_source_rows(resolved_source, identities)
         if checked_rows != len(identities):
             raise ValueError("source preflight row count changed")
 
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not set")
-        from google import genai
-
         settings = Settings(
             model=args.model,
             concurrency=args.concurrency,
@@ -571,25 +636,11 @@ async def async_main(args: argparse.Namespace) -> int:
             hf_bucket=args.hf_bucket,
             sync_enabled=not args.no_sync,
         )
-        sync_client = genai.Client(
-            api_key=api_key,
-            http_options={
-                "api_version": "v1beta",
-                "timeout": settings.timeout_ms,
-                "retry_options": {
-                    "attempts": 5,
-                    "initial_delay": 1.0,
-                    "max_delay": 32.0,
-                    "exp_base": 2.0,
-                    "jitter": 1.0,
-                    "http_status_codes": [408, 429, 500, 502, 503, 504],
-                },
-            },
-        )
+        sync_client = create_gemini_client(api_key, settings)
         client = sync_client.aio
         semaphore = asyncio.Semaphore(settings.concurrency)
         pending = iter_pending_slots(
-            args.original_source,
+            resolved_source,
             identities,
             secondary_source_ids,
             completed,
@@ -598,6 +649,7 @@ async def async_main(args: argparse.Namespace) -> int:
             pending = itertools.islice(pending, args.limit)
 
         processed = accepted_this_run = failed_this_run = shard_count = 0
+        forced_exit_code = 0
         try:
             while True:
                 request_batch = list(
@@ -659,7 +711,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 )
                 write_progress_manifest(
                     args.output_dir,
-                    source=args.original_source,
+                    source=resolved_source,
                     source_rows=len(identities),
                     target_rows=args.target_rows,
                     completed_rows=len(completed),
@@ -672,10 +724,12 @@ async def async_main(args: argparse.Namespace) -> int:
                     for attempt in all_attempts
                 ):
                     print("Stopping after a fatal provider/configuration response.")
-                    return 2
+                    forced_exit_code = 2
+                    break
                 if batch_accepted == 0:
                     print("Stopping because the entire request batch remained incomplete.")
-                    return 2
+                    forced_exit_code = 2
+                    break
                 if (
                     settings.sync_enabled
                     and shard_count % settings.sync_every_shards == 0
@@ -683,11 +737,15 @@ async def async_main(args: argparse.Namespace) -> int:
                     sync_output(args.output_dir, settings.hf_bucket)
                     print(f"Synchronized after {shard_count} new shards.")
         finally:
-            await client.aclose()
+            try:
+                await client.aclose()
+            finally:
+                if settings.sync_enabled:
+                    sync_output(args.output_dir, settings.hf_bucket)
+                    print("Final refinement-state synchronization complete.")
 
-        if settings.sync_enabled:
-            sync_output(args.output_dir, settings.hf_bucket)
-            print("Final refinement-state synchronization complete.")
+        if forced_exit_code:
+            return forced_exit_code
 
         final_remaining = args.target_rows - len(completed)
         if final_remaining and (args.limit is None or failed_this_run):
