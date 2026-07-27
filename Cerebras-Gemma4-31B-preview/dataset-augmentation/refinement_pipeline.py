@@ -11,8 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import string
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ AUGMENTATION_FIELDS = {
     "source_file",
     "source_row_index",
     "source_trial_name",
+    "source_conversation_fingerprint",
     "source_task_id",
     "source_run_id",
     "refinement_index",
@@ -49,6 +51,7 @@ class SourceIdentity:
     source_file: str
     source_row_index: int
     source_trial_name: str
+    source_conversation_fingerprint: str
     source_run_id: str
     source_task_id: str
 
@@ -61,6 +64,7 @@ class RefinementSlot:
     source_file: str
     source_row_index: int
     source_trial_name: str
+    source_conversation_fingerprint: str
     source_run_id: str
     source_task_id: str
     refinement_index: int
@@ -124,6 +128,22 @@ def conversation_fingerprint(conversations: Any) -> str:
     return hashlib.sha256(canonical_conversation_json(conversations).encode()).hexdigest()
 
 
+def source_conversation_fingerprint(conversations: Any) -> str:
+    """Fingerprint source turns while permitting source-specific empty/final roles."""
+    normalized = normalize_conversations(
+        conversations,
+        require_nonempty_content=False,
+        require_final_assistant=False,
+    )
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def stable_synthetic_id(source_record_id: str, refinement_index: int) -> str:
     if not isinstance(source_record_id, str) or not source_record_id:
         raise ValueError("source record ID must be a non-empty string")
@@ -135,15 +155,182 @@ def stable_synthetic_id(source_record_id: str, refinement_index: int) -> str:
     return f"refined-{digest}"
 
 
-def stable_source_record_id(source_file: str, source_row_index: int) -> str:
+def stable_source_record_id(
+    source_file: str,
+    source_row_index: int,
+    source_trial_name: str,
+    source_run_id: str,
+    source_task_id: str,
+    conversation_sha256: str,
+) -> str:
     if not isinstance(source_file, str) or not source_file:
         raise ValueError("source file must be a non-empty string")
     if not isinstance(source_row_index, int) or source_row_index < 0:
         raise ValueError("source row index must be a non-negative integer")
+    lineage = (
+        source_trial_name,
+        source_run_id,
+        source_task_id,
+        conversation_sha256,
+    )
+    if any(not isinstance(value, str) or not value for value in lineage):
+        raise ValueError("source lineage and conversation fingerprint must be strings")
     digest = hashlib.sha256(
-        f"source-row\0{source_file}\0{source_row_index}".encode()
+        (
+            f"source-row\0{source_file}\0{source_row_index}\0"
+            f"{source_trial_name}\0{source_run_id}\0{source_task_id}\0"
+            f"{conversation_sha256}"
+        ).encode()
     ).hexdigest()[:24]
     return f"source-{digest}"
+
+
+def _update_source_identity_digest(
+    digest: Any, identity: SourceIdentity
+) -> None:
+    digest.update(
+        (
+            f"{identity.source_record_id}\0{identity.source_file}\0"
+            f"{identity.source_row_index}\0{identity.source_trial_name}\0"
+            f"{identity.source_run_id}\0{identity.source_task_id}\0"
+            f"{identity.source_conversation_fingerprint}\n"
+        ).encode()
+    )
+
+
+def source_identity_digest(identities: Iterable[SourceIdentity]) -> str:
+    """Hash source identities in deterministic physical iteration order."""
+    digest = hashlib.sha256()
+    for identity in identities:
+        _update_source_identity_digest(digest, identity)
+    return digest.hexdigest()
+
+
+def source_schema_digest(schema: pa.Schema) -> str:
+    return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
+
+
+def pin_source_revision(source: str) -> str:
+    """Resolve an HF dataset URI to an immutable full commit revision."""
+    if not source.startswith("hf://datasets/"):
+        return source
+
+    from huggingface_hub import HfApi, parse_hf_uri
+
+    uri = parse_hf_uri(source)
+    info = HfApi().dataset_info(uri.id, revision=uri.revision)
+    revision = getattr(info, "sha", None)
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or any(character not in string.hexdigits for character in revision)
+    ):
+        raise ValueError(f"could not resolve an immutable revision for {source}")
+    suffix = f"/{uri.path_in_repo}" if uri.path_in_repo else ""
+    return f"hf://datasets/{uri.id}@{revision}{suffix}"
+
+
+@dataclass(frozen=True)
+class SourceManifest:
+    version: int
+    requested_source: str
+    resolved_source: str
+    source_rows: int
+    source_identity_sha256: str
+    source_schema_sha256: str
+
+
+def load_source_manifest(path: Path) -> SourceManifest:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid source manifest: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"source manifest is not an object: {path}")
+    try:
+        manifest = SourceManifest(
+            version=value["version"],
+            requested_source=value["requested_source"],
+            resolved_source=value["resolved_source"],
+            source_rows=value["source_rows"],
+            source_identity_sha256=value["source_identity_sha256"],
+            source_schema_sha256=value["source_schema_sha256"],
+        )
+    except KeyError as exc:
+        raise ValueError(f"source manifest is missing {exc.args[0]!r}: {path}") from exc
+    if (
+        manifest.version != 1
+        or not isinstance(manifest.requested_source, str)
+        or not manifest.requested_source
+        or not isinstance(manifest.resolved_source, str)
+        or not manifest.resolved_source
+        or not isinstance(manifest.source_rows, int)
+        or manifest.source_rows <= 0
+        or not isinstance(manifest.source_identity_sha256, str)
+        or len(manifest.source_identity_sha256) != 64
+        or any(
+            character not in string.hexdigits
+            for character in manifest.source_identity_sha256
+        )
+        or not isinstance(manifest.source_schema_sha256, str)
+        or len(manifest.source_schema_sha256) != 64
+        or any(
+            character not in string.hexdigits
+            for character in manifest.source_schema_sha256
+        )
+    ):
+        raise ValueError(f"source manifest contains invalid values: {path}")
+    return manifest
+
+
+def resolve_source_for_run(manifest_path: Path, requested_source: str) -> str:
+    """Reuse a run's pinned source, or resolve a new immutable source."""
+    if manifest_path.exists():
+        manifest = load_source_manifest(manifest_path)
+        if requested_source not in {
+            manifest.requested_source,
+            manifest.resolved_source,
+        }:
+            raise ValueError(
+                "requested source conflicts with the existing source manifest: "
+                f"{requested_source!r}"
+            )
+        return manifest.resolved_source
+    return pin_source_revision(requested_source)
+
+
+def ensure_source_manifest(
+    path: Path,
+    *,
+    requested_source: str,
+    resolved_source: str,
+    schema: pa.Schema,
+    identities: Mapping[str, SourceIdentity],
+) -> SourceManifest:
+    manifest = SourceManifest(
+        version=1,
+        requested_source=requested_source,
+        resolved_source=resolved_source,
+        source_rows=len(identities),
+        source_identity_sha256=source_identity_digest(identities.values()),
+        source_schema_sha256=source_schema_digest(schema),
+    )
+    if path.exists():
+        existing = load_source_manifest(path)
+        if existing != manifest:
+            raise ValueError("source data does not match the immutable run manifest")
+        return existing
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(manifest.__dict__, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with temporary.open("rb") as stream:
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    return manifest
 
 
 def choose_secondary_source_ids(
@@ -186,6 +373,9 @@ def refinement_slots_for_source(
             source_file=identity.source_file,
             source_row_index=identity.source_row_index,
             source_trial_name=identity.source_trial_name,
+            source_conversation_fingerprint=(
+                identity.source_conversation_fingerprint
+            ),
             source_run_id=identity.source_run_id,
             source_task_id=identity.source_task_id,
             refinement_index=index,
@@ -267,6 +457,7 @@ def source_identity_for_row(
     source_trial_name = row.get("trial_name")
     source_run_id = row.get("run_id")
     source_task_id = row.get("task")
+    conversation_sha256 = source_conversation_fingerprint(row.get("conversations"))
     if not isinstance(source_trial_name, str) or not source_trial_name:
         raise ValueError("source contains a missing or non-string trial_name")
     if not isinstance(source_run_id, str) or not source_run_id:
@@ -276,10 +467,18 @@ def source_identity_for_row(
             f"source row {source_run_id!r} has a missing or non-string task"
         )
     return SourceIdentity(
-        source_record_id=stable_source_record_id(source_file, source_row_index),
+        source_record_id=stable_source_record_id(
+            source_file,
+            source_row_index,
+            source_trial_name,
+            source_run_id,
+            source_task_id,
+            conversation_sha256,
+        ),
         source_file=source_file,
         source_row_index=source_row_index,
         source_trial_name=source_trial_name,
+        source_conversation_fingerprint=conversation_sha256,
         source_run_id=source_run_id,
         source_task_id=source_task_id,
     )
@@ -297,7 +496,7 @@ def load_source_identities(
     schema = read_source_schema(source)
     identities: dict[str, SourceIdentity] = {}
     for source_file, row_offset, batch in iter_source_batches_with_coordinates(
-        source, columns=("trial_name", "run_id", "task")
+        source, columns=("conversations", "trial_name", "run_id", "task")
     ):
         for index, row in enumerate(batch.to_pylist(), start=row_offset):
             identity = source_identity_for_row(source_file, index, row)
@@ -331,6 +530,7 @@ def build_augmented_schema(original_schema: pa.Schema) -> pa.Schema:
                 original_schema.field("trial_name").type,
                 nullable=True,
             ),
+            pa.field("source_conversation_fingerprint", pa.string(), nullable=True),
             pa.field(
                 "source_task_id",
                 original_schema.field("task").type,
@@ -361,6 +561,11 @@ def build_refined_row(
         raise ValueError("refinement slot does not match the source row run_id")
     if source_row.get("task") != slot.source_task_id:
         raise ValueError("refinement slot does not match the source row task")
+    if (
+        source_conversation_fingerprint(source_row.get("conversations"))
+        != slot.source_conversation_fingerprint
+    ):
+        raise ValueError("refinement slot does not match the source conversation")
 
     row = {name: source_row.get(name) for name in original_schema.names}
     row["conversations"] = normalize_conversations(conversations)
@@ -375,6 +580,9 @@ def build_refined_row(
     row["source_file"] = slot.source_file
     row["source_row_index"] = slot.source_row_index
     row["source_trial_name"] = slot.source_trial_name
+    row["source_conversation_fingerprint"] = (
+        slot.source_conversation_fingerprint
+    )
     row["source_task_id"] = slot.source_task_id
     row["source_run_id"] = slot.source_run_id
     row["refinement_index"] = slot.refinement_index
