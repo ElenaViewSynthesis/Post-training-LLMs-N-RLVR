@@ -14,11 +14,12 @@ candidates for a refinement slot. It assigns:
 - one additional refinement to a deterministic 55,666-row subset.
 
 The subset is chosen by a stable hash of a physical source-row identity derived
-from the sorted Parquet file path and row index. Both `run_id` and `trial_name`
-repeat in the real data, so neither is safe as a row key. They and the original
-task remain lineage metadata. A rejected generation is retried for the same
-slot until a result passes validation. The first accepted result completes that
-slot permanently.
+from the sorted Parquet file path, row index, lineage fields, and a canonical
+conversation fingerprint. Both `run_id` and `trial_name` repeat in the real
+data, so neither is safe as a row key. They and the original task remain
+lineage metadata. A rejected generation is retried for the same slot until a
+result passes validation. The first accepted result completes that slot
+permanently.
 
 ## Architecture
 
@@ -47,11 +48,15 @@ execute them in a live sandbox.
 - API calls are concurrent but bounded by `--concurrency`.
 - Only one worker can own a refinement output directory.
 - Every paid request is assigned to a deterministic source row and slot.
+- A remote source URI is resolved to a full immutable dataset commit before
+  slot assignment, then recorded with source-identity and schema digests.
 - All source identities and conversations are checked before paid requests.
 - Generated conversations must remain nested `{role, content}` records, contain
   2–40 non-empty turns, and end with an assistant turn.
 - Accepted rows use an explicit Arrow schema and atomic immutable shards.
 - Resume state is derived from accepted Parquet shards, not optimistic counters.
+- Every enabled worker run synchronizes in a finalization path, including fatal
+  and incomplete batches; a completed rerun synchronizes without opening Gemini.
 - Duplicate or unknown synthetic IDs stop the run.
 - Stage 6 dry-run performs no local or remote writes.
 - Stage 6 always writes to a fresh staging directory.
@@ -102,6 +107,12 @@ Check status without initializing Gemini:
 uv run python stream_refinement_worker.py --status-only
 ```
 
+Retry synchronization without reading the source or initializing Gemini:
+
+```bash
+uv run python stream_refinement_worker.py --sync-only
+```
+
 Make one request without remote synchronization:
 
 ```bash
@@ -126,6 +137,7 @@ Important options:
 --max-attempts-per-run
 --limit
 --status-only
+--sync-only
 --no-sync
 ```
 
@@ -137,12 +149,18 @@ Local refinement state:
     accepted-<content-id>.parquet
   attempts.jsonl
   progress.json
+  source_manifest.json
 ```
 
 `attempts.jsonl` is an audit log. Successful resume state comes from validated
 accepted Parquet shards. A crash after an API response but before shard
 promotion may cause the assigned slot to be requested again, but it cannot
 create two stored successes for that slot.
+
+`source_manifest.json` binds the run to its requested source, resolved immutable
+source, exact physical-row/conversation identity digest, and Arrow schema
+digest. Stage 6 refuses to publish accepted shards without this manifest or
+against a different source snapshot.
 
 ## Stage 6: exact publication
 
@@ -232,7 +250,7 @@ process.
 
 | Accepted refinements | Source rows | Published rows | Peak RSS | Wall time |
 |---:|---:|---:|---:|---:|
-| 10,000 | 6,667 | 16,667 | 174 MiB | 5.3 s |
+| 10,000 | 6,667 | 16,667 | 187 MiB | 12.0 s |
 | 100,000 | 66,667 | 166,667 | 269 MiB | 9.2 s |
 | 225,000 | 150,000 | 375,000 | 327 MiB | 17.6 s |
 
