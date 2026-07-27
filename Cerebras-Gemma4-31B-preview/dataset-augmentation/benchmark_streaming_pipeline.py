@@ -27,8 +27,10 @@ from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
     choose_secondary_source_ids,
+    ensure_source_manifest,
     iter_source_batches_with_coordinates,
     load_source_identities,
+    load_source_manifest,
     refinement_slots_for_source,
     source_identity_for_row,
     write_accepted_shard,
@@ -125,6 +127,13 @@ def write_refinement_fixture(
     shard_rows: int,
 ) -> None:
     original_schema, identities = load_source_identities(str(source_dir))
+    ensure_source_manifest(
+        accepted_dir.parent / "source_manifest.json",
+        requested_source=str(source_dir),
+        resolved_source=str(source_dir),
+        schema=original_schema,
+        identities=identities,
+    )
     secondary = choose_secondary_source_ids(list(identities), target_rows)
     output_schema = build_augmented_schema(original_schema)
     buffer: list[dict] = []
@@ -190,11 +199,18 @@ def execute(root: Path, args: argparse.Namespace) -> dict:
     timings["generate_refinements_seconds"] = time.perf_counter() - started
 
     started = time.perf_counter()
+    source_manifest = load_source_manifest(
+        accepted_dir.parent / "source_manifest.json"
+    )
     preflight = preflight_publication(
         str(source_dir),
         accepted_dir,
         expected_new_rows=args.accepted_rows,
         expected_total_rows=source_rows + args.accepted_rows,
+        expected_source_identity_sha256=(
+            source_manifest.source_identity_sha256
+        ),
+        expected_source_schema_sha256=source_manifest.source_schema_sha256,
     )
     timings["preflight_seconds"] = time.perf_counter() - started
 
