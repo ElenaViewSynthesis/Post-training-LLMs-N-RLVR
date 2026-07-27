@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,10 +16,15 @@ from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
     choose_secondary_source_ids,
+    ensure_source_manifest,
     load_source_identities,
+    load_source_manifest,
     normalize_conversations,
+    pin_source_revision,
     refinement_slots_for_source,
     scan_accepted_shards,
+    source_conversation_fingerprint,
+    source_identity_digest,
     stable_synthetic_id,
     write_accepted_shard,
 )
@@ -61,11 +67,15 @@ def source_row(run_id: str, task: str = "task-a") -> dict:
 def source_identity(
     record_id: str, run_id: str, task: str = "task-a", row_index: int = 0
 ) -> SourceIdentity:
+    row = source_row(run_id, task)
     return SourceIdentity(
         source_record_id=record_id,
         source_file="fixture/train.parquet",
         source_row_index=row_index,
         source_trial_name=run_id,
+        source_conversation_fingerprint=source_conversation_fingerprint(
+            row["conversations"]
+        ),
         source_run_id=run_id,
         source_task_id=task,
     )
@@ -155,6 +165,83 @@ class RefinementPipelineTests(unittest.TestCase):
         self.assertEqual(set(by_trial), {"source-1", "source-2"})
         self.assertEqual(by_trial["source-1"].source_run_id, "source-1")
         self.assertEqual(by_trial["source-2"].source_task_id, "task-b")
+
+    def test_source_identity_changes_when_conversation_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source_dir = Path(temporary_directory) / "source"
+            source_dir.mkdir()
+            source_path = source_dir / "train-00000.parquet"
+            original = source_row("source-1")
+            pq.write_table(
+                pa.Table.from_pylist([original], schema=SOURCE_SCHEMA),
+                source_path,
+            )
+            schema, before = load_source_identities(str(source_dir))
+            manifest_path = Path(temporary_directory) / "refined/source_manifest.json"
+            ensure_source_manifest(
+                manifest_path,
+                requested_source=str(source_dir),
+                resolved_source=str(source_dir),
+                schema=schema,
+                identities=before,
+            )
+
+            changed = source_row("source-1")
+            changed["conversations"][1]["content"] = "Changed upstream content"
+            pq.write_table(
+                pa.Table.from_pylist([changed], schema=SOURCE_SCHEMA),
+                source_path,
+            )
+            changed_schema, after = load_source_identities(str(source_dir))
+
+            self.assertNotEqual(set(before), set(after))
+            self.assertNotEqual(
+                source_identity_digest(before.values()),
+                source_identity_digest(after.values()),
+            )
+            with self.assertRaisesRegex(ValueError, "immutable run manifest"):
+                ensure_source_manifest(
+                    manifest_path,
+                    requested_source=str(source_dir),
+                    resolved_source=str(source_dir),
+                    schema=changed_schema,
+                    identities=after,
+                )
+
+    def test_source_manifest_round_trips_and_hf_source_is_pinned(self) -> None:
+        source = "hf://datasets/example/data/data/train-*.parquet"
+        revision = "a" * 40
+        with mock.patch("huggingface_hub.HfApi") as api:
+            api.return_value.dataset_info.return_value.sha = revision
+            resolved = pin_source_revision(source)
+
+        self.assertEqual(
+            resolved,
+            f"hf://datasets/example/data@{revision}/data/train-*.parquet",
+        )
+        api.return_value.dataset_info.assert_called_once_with(
+            "example/data", revision=None
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            pq.write_table(
+                pa.Table.from_pylist([source_row("source-1")], schema=SOURCE_SCHEMA),
+                source_dir / "train-00000.parquet",
+            )
+            schema, identities = load_source_identities(str(source_dir))
+            path = root / "refined/source_manifest.json"
+            written = ensure_source_manifest(
+                path,
+                requested_source=str(source_dir),
+                resolved_source=str(source_dir),
+                schema=schema,
+                identities=identities,
+            )
+
+            self.assertEqual(load_source_manifest(path), written)
 
     def test_physical_identity_distinguishes_repeated_logical_ids(self) -> None:
         first = source_row("shared-run", "task-a")
