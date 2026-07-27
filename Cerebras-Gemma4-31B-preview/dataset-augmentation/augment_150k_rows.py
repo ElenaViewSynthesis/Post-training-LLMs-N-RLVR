@@ -31,6 +31,7 @@ import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from huggingface_hub import sync_bucket
 from publication_pipeline import preflight_publication, write_local_publication
+from refinement_pipeline import load_source_manifest
 
 load_dotenv()
 
@@ -258,11 +259,25 @@ def reshape_to_original_schema(validated: pd.DataFrame, tasks: pd.DataFrame, ori
 
 
 def run(args: argparse.Namespace) -> int:
+    source_manifest_path = args.refined_dir.parent / "source_manifest.json"
+    source_manifest = load_source_manifest(source_manifest_path)
+    if args.original_source not in {
+        source_manifest.requested_source,
+        source_manifest.resolved_source,
+    }:
+        raise ValueError(
+            "--original-source conflicts with the refinement source manifest: "
+            f"{args.original_source!r}"
+        )
     preflight = preflight_publication(
-        args.original_source,
+        source_manifest.resolved_source,
         args.refined_dir,
         expected_new_rows=args.expected_new_rows,
         expected_total_rows=args.expected_total_rows,
+        expected_source_identity_sha256=(
+            source_manifest.source_identity_sha256
+        ),
+        expected_source_schema_sha256=source_manifest.source_schema_sha256,
     )
     print(
         f"Preflight: original={preflight.original_rows:,} "
