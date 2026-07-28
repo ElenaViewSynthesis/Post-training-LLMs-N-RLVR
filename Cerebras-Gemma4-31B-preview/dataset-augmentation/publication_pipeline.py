@@ -6,11 +6,13 @@ import hashlib
 import json
 import math
 import os
+import string
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import fsspec
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -38,6 +40,9 @@ from refinement_pipeline import (
     verify_refinement_state_inventory,
     verify_source_manifest_content,
 )
+
+
+PUBLICATION_COMPLETE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -72,7 +77,6 @@ def _publication_id(
     accepted_ids: set[str],
     accepted_shards: tuple[Path, ...],
     source_identities: dict[str, SourceIdentity],
-    original_source: str,
     total_rows: int,
     source_identity_sha256: str,
     source_schema_sha256: str,
@@ -80,7 +84,6 @@ def _publication_id(
     run_manifest: RunManifest,
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(f"source={original_source}\n".encode())
     digest.update(f"total={total_rows}\n".encode())
     digest.update(f"source_identity_sha256={source_identity_sha256}\n".encode())
     digest.update(f"source_schema_sha256={source_schema_sha256}\n".encode())
@@ -320,7 +323,6 @@ def preflight_publication(
             accepted_ids,
             accepted_shards,
             source_identities,
-            original_source,
             total_rows,
             source_identity_sha256,
             source_schema_sha256,
@@ -501,6 +503,114 @@ def _write_manifest(
     return path
 
 
+def _write_publication_complete(run_dir: Path, manifest_path: Path) -> Path:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("cannot seal a publication without declared data files")
+    path = run_dir / "publication_complete.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": PUBLICATION_COMPLETE_VERSION,
+                "publication_id": manifest.get("publication_id"),
+                "manifest_sha256": file_sha256(manifest_path),
+                "file_count": len(files),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def verify_remote_publication(remote_publication: str) -> list[dict[str, Any]]:
+    """Read back a synchronized publication marker, inventory, and every shard."""
+    filesystem, root = fsspec.core.url_to_fs(remote_publication)
+    root = root.rstrip("/")
+
+    def remote_path(relative: str) -> str:
+        return f"{root}/{relative}"
+
+    try:
+        manifest_bytes = filesystem.cat_file(
+            remote_path("publication_manifest.json")
+        )
+        complete_bytes = filesystem.cat_file(
+            remote_path("publication_complete.json")
+        )
+        manifest = json.loads(manifest_bytes)
+        complete = json.loads(complete_bytes)
+    except Exception as exc:  # noqa: BLE001 - remote filesystem boundary
+        raise ValueError(
+            f"remote publication metadata could not be read: {remote_publication}"
+        ) from exc
+    if not isinstance(manifest, dict) or not isinstance(complete, dict):
+        raise ValueError("remote publication metadata is malformed")
+    entries = manifest.get("files")
+    if not isinstance(entries, list) or not entries or any(
+        not isinstance(entry, dict) for entry in entries
+    ):
+        raise ValueError("remote publication manifest has invalid file entries")
+    if (
+        complete.get("version") != PUBLICATION_COMPLETE_VERSION
+        or complete.get("publication_id") != manifest.get("publication_id")
+        or complete.get("manifest_sha256")
+        != hashlib.sha256(manifest_bytes).hexdigest()
+        or complete.get("file_count") != len(entries)
+    ):
+        raise ValueError("remote publication manifest and complete marker mismatch")
+
+    expected_files = {"publication_manifest.json", "publication_complete.json"}
+    validated_entries: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for entry in entries:
+        name = entry.get("name")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.endswith(".parquet")
+            or not isinstance(entry.get("bytes"), int)
+            or entry["bytes"] <= 0
+            or not isinstance(entry.get("sha256"), str)
+            or len(entry["sha256"]) != 64
+            or any(character not in string.hexdigits for character in entry["sha256"])
+            or name in seen_names
+        ):
+            raise ValueError("remote publication manifest contains an invalid entry")
+        seen_names.add(name)
+        expected_files.add(f"data/{name}")
+        validated_entries.append(entry)
+    try:
+        actual_files = {
+            str(path)[len(root) + 1 :]
+            for path in filesystem.find(root)
+            if str(path) != root and not filesystem.isdir(path)
+        }
+    except Exception as exc:  # noqa: BLE001 - remote listing boundary
+        raise ValueError("remote publication file listing failed") from exc
+    if actual_files != expected_files:
+        raise ValueError(
+            "remote publication file set mismatch: "
+            f"missing={sorted(expected_files - actual_files)[:3]}, "
+            f"unexpected={sorted(actual_files - expected_files)[:3]}"
+        )
+    for entry in validated_entries:
+        digest = hashlib.sha256()
+        size = 0
+        with filesystem.open(remote_path(f"data/{entry['name']}"), "rb") as stream:
+            while chunk := stream.read(1_048_576):
+                digest.update(chunk)
+                size += len(chunk)
+        if size != entry["bytes"] or digest.hexdigest() != entry["sha256"]:
+            raise ValueError(
+                f"remote publication checksum mismatch: {entry['name']}"
+            )
+    return validated_entries
+
+
 def _write_current_pointer(output_root: Path, preflight: PublicationPreflight) -> None:
     current = {
         "publication_id": preflight.publication_id,
@@ -563,6 +673,13 @@ def validate_existing_publication(
                 f"existing publication manifest has unexpected {key}: "
                 f"{manifest.get(key)!r} != {expected!r}"
             )
+    complete_path = final_dir / "publication_complete.json"
+    try:
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"existing publication has no valid complete marker: {complete_path}"
+        ) from exc
     entries = manifest.get("files")
     if (
         not isinstance(entries, list)
@@ -580,6 +697,14 @@ def validate_existing_publication(
     )
     if actual_entries != entries:
         raise ValueError("existing publication shard checksums do not match its manifest")
+    if (
+        not isinstance(complete, dict)
+        or complete.get("version") != PUBLICATION_COMPLETE_VERSION
+        or complete.get("publication_id") != preflight.publication_id
+        or complete.get("manifest_sha256") != file_sha256(manifest_path)
+        or complete.get("file_count") != len(entries)
+    ):
+        raise ValueError("existing publication complete marker is invalid")
 
 
 def write_local_publication(
@@ -653,7 +778,8 @@ def write_local_publication(
             preflight.output_schema,
             preflight.total_rows,
         )
-        _write_manifest(work_dir, preflight, files)
+        publication_manifest = _write_manifest(work_dir, preflight, files)
+        _write_publication_complete(work_dir, publication_manifest)
         os.replace(work_dir, final_dir)
         _write_current_pointer(output_root, preflight)
     except Exception:
