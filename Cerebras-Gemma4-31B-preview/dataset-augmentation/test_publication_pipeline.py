@@ -13,7 +13,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import augment_150k_rows
-from publication_pipeline import preflight_publication, write_local_publication
+from publication_pipeline import (
+    preflight_publication,
+    verify_remote_publication,
+    write_local_publication,
+)
 from refinement_pipeline import (
     build_augmented_schema,
     build_refined_row,
@@ -203,6 +207,13 @@ class PublicationPipelineTests(unittest.TestCase):
             )
             self.assertEqual(len(manifest["source_files"]), 2)
             self.assertEqual(current["publication_id"], preflight.publication_id)
+            self.assertTrue(
+                (publication_dir / "publication_complete.json").is_file()
+            )
+            self.assertEqual(
+                verify_remote_publication(str(publication_dir)),
+                manifest["files"],
+            )
             self.assertEqual(stale.read_bytes(), b"stale")
             self.assertNotIn(stale, data_shards)
 
@@ -524,6 +535,37 @@ class PublicationPipelineTests(unittest.TestCase):
                 side_effect=RuntimeError("network unavailable"),
             ):
                 self.assertEqual(augment_150k_rows.main(args), 1)
+
+    def test_remote_readback_failure_is_not_reported_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir, accepted_dir = create_fixture(root)
+            args = [
+                "--original-source",
+                str(source_dir),
+                "--refined-dir",
+                str(accepted_dir),
+                "--upload-dir",
+                str(root / "upload"),
+                "--expected-new-rows",
+                "6",
+                "--expected-total-rows",
+                "10",
+                "--rows-per-shard",
+                "2",
+            ]
+            with (
+                mock.patch.object(augment_150k_rows, "sync_bucket") as sync,
+                mock.patch.object(
+                    augment_150k_rows,
+                    "verify_remote_publication",
+                    side_effect=ValueError("remote checksum mismatch"),
+                ) as verify_remote,
+            ):
+                self.assertEqual(augment_150k_rows.main(args), 1)
+
+            sync.assert_called_once()
+            verify_remote.assert_called_once()
 
 
 if __name__ == "__main__":
