@@ -23,6 +23,7 @@ from refinement_pipeline import (
     ensure_run_manifest,
     ensure_source_manifest,
     load_source_identities,
+    load_source_manifest,
     load_run_manifest,
     refinement_slots_for_source,
     scan_accepted_shards,
@@ -31,6 +32,8 @@ from refinement_pipeline import (
     write_refinement_state_inventory,
 )
 from stream_refinement_worker import (
+    ProviderPreflightError,
+    ProviderRequestBudget,
     RefinementSyncError,
     Settings,
     SlotResult,
@@ -40,6 +43,7 @@ from stream_refinement_worker import (
     build_refinement_prompt,
     load_attempt_counts,
     parse_args,
+    provider_preflight,
     refine_slot,
     resolve_batch_conversation_collisions,
     sync_output,
@@ -174,6 +178,12 @@ def worker_args(source_dir: Path, output_dir: Path, target_rows: int) -> object:
 class ClosingAsyncClient:
     def __init__(self) -> None:
         self.closed = False
+        self.preflight_calls = 0
+        self.models = SimpleNamespace(get=self.get_model)
+
+    async def get_model(self, **_: object) -> SimpleNamespace:
+        self.preflight_calls += 1
+        return SimpleNamespace(name="test-model")
 
     async def aclose(self) -> None:
         self.closed = True
@@ -310,6 +320,30 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
         load_source.assert_not_called()
         create_client.assert_not_called()
 
+    async def test_provider_preflight_only_never_reads_source_or_generates(self) -> None:
+        args = parse_args(
+            ["--provider-preflight-only", "--model", "test-model"]
+        )
+        client = ClosingAsyncClient()
+        client.interactions = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+            mock.patch(
+                "stream_refinement_worker.create_gemini_client",
+                return_value=SimpleNamespace(aio=client),
+            ),
+            mock.patch(
+                "stream_refinement_worker.load_source_identities"
+            ) as load_source,
+        ):
+            exit_code = await async_main(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(client.preflight_calls, 1)
+        self.assertTrue(client.closed)
+        load_source.assert_not_called()
+        client.interactions.create.assert_not_called()
+
     async def test_fresh_runs_use_distinct_remote_prefixes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -328,7 +362,12 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                 manifests[0].run_instance_id,
                 manifests[1].run_instance_id,
             )
-            with mock.patch("huggingface_hub.sync_bucket") as bucket_sync:
+            with (
+                mock.patch("huggingface_hub.sync_bucket") as bucket_sync,
+                mock.patch(
+                    "stream_refinement_worker.verify_remote_refinement_state"
+                ) as verify_remote,
+            ):
                 for output_dir in output_dirs:
                     sync_output(
                         output_dir,
@@ -338,6 +377,7 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
 
             destinations = [call.args[1] for call in bucket_sync.call_args_list]
             self.assertEqual(len(destinations), 2)
+            self.assertEqual(verify_remote.call_count, 2)
             self.assertNotEqual(destinations[0], destinations[1])
             self.assertTrue(
                 destinations[0].endswith(
@@ -349,6 +389,30 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                     f"/runs/{manifests[1].run_instance_id}"
                 )
             )
+
+    async def test_worker_materializes_and_reuses_local_source_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root, row_count=2)
+            output_dir = root / "refined"
+            snapshot_dir = root / "source-snapshot"
+            args = worker_args(source_dir, output_dir, target_rows=2)
+            args.status_only = True
+            args.source_snapshot_dir = snapshot_dir
+
+            self.assertEqual(await async_main(args), 0)
+            source_manifest = load_source_manifest(
+                output_dir / "source_manifest.json"
+            )
+            _, identities = load_source_identities(str(snapshot_dir))
+
+            self.assertEqual(source_manifest.resolved_source, str(snapshot_dir))
+            self.assertEqual(len(source_manifest.source_files), 1)
+            self.assertEqual(
+                {identity.source_file for identity in identities.values()},
+                {str(source_dir / "train-00000.parquet")},
+            )
+            self.assertEqual(await async_main(args), 0)
 
     async def test_sync_only_reuses_the_existing_run_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -376,6 +440,9 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch(
                     "stream_refinement_worker.create_gemini_client"
                 ) as create_client,
+                mock.patch(
+                    "stream_refinement_worker.verify_remote_refinement_state"
+                ) as verify_remote,
             ):
                 self.assertEqual(await async_main(sync_args), 0)
 
@@ -386,8 +453,38 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
             load_source.assert_not_called()
             create_client.assert_not_called()
+            verify_remote.assert_called_once_with(
+                "hf://buckets/example/refined/runs/"
+                f"{run_manifest.run_instance_id}"
+            )
 
-    async def test_source_content_is_reverified_before_gemini_initialization(self) -> None:
+    async def test_remote_readback_failure_fails_refinement_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root)
+            output_dir = root / "refined"
+            write_completed_fixture(source_dir, output_dir)
+            with (
+                mock.patch("huggingface_hub.sync_bucket") as bucket_sync,
+                mock.patch(
+                    "stream_refinement_worker.verify_remote_refinement_state",
+                    side_effect=ValueError("remote checksum mismatch"),
+                ) as verify_remote,
+            ):
+                with self.assertRaisesRegex(
+                    RefinementSyncError,
+                    "remote checksum mismatch",
+                ):
+                    sync_output(
+                        output_dir,
+                        "hf://buckets/example/refined",
+                        verify_hashes=True,
+                    )
+
+            bucket_sync.assert_called_once()
+            verify_remote.assert_called_once()
+
+    async def test_provider_preflight_precedes_source_content_reverification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             source_dir = write_source_fixture(root)
@@ -404,12 +501,162 @@ class StreamRefinementWorkerTests(unittest.IsolatedAsyncioTestCase):
                 source_path,
             )
             run_args = worker_args(source_dir, output_dir, target_rows=1)
-            with mock.patch(
-                "stream_refinement_worker.create_gemini_client"
-            ) as create_client:
+            client = ClosingAsyncClient()
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ) as create_client,
+            ):
                 with self.assertRaisesRegex(ValueError, "immutable run manifest"):
                     await async_main(run_args)
-            create_client.assert_not_called()
+            create_client.assert_called_once()
+            self.assertEqual(client.preflight_calls, 1)
+            self.assertTrue(client.closed)
+
+    async def test_provider_preflight_failure_skips_source_hashing(self) -> None:
+        class UnauthorizedError(Exception):
+            status_code = 401
+
+        class UnauthorizedModels:
+            async def get(self, **_: object) -> object:
+                raise UnauthorizedError("invalid test-key")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            output_dir = root / "refined"
+            args = worker_args(root / "source", output_dir, target_rows=1)
+            client = ClosingAsyncClient()
+            client.models = UnauthorizedModels()
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ),
+                mock.patch(
+                    "stream_refinement_worker.load_source_identities"
+                ) as load_source,
+            ):
+                with self.assertRaisesRegex(
+                    ProviderPreflightError,
+                    "HTTP 401",
+                ):
+                    await async_main(args)
+
+        load_source.assert_not_called()
+        self.assertTrue(client.closed)
+
+    async def test_provider_preflight_uses_model_get_without_spending_budget(self) -> None:
+        client = ClosingAsyncClient()
+        budget = ProviderRequestBudget(1)
+
+        await provider_preflight(client, settings(), "test-key")
+
+        self.assertEqual(client.preflight_calls, 1)
+        self.assertEqual(budget.used, 0)
+        self.assertEqual(budget.remaining, 1)
+
+    async def test_request_budget_is_exact_under_concurrency_and_retries(self) -> None:
+        class RejectingInteractions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def create(self, **_: object) -> SimpleNamespace:
+                self.calls += 1
+                await asyncio.sleep(0)
+                return SimpleNamespace(
+                    output_text="not-json",
+                    id=f"interaction-{self.calls}",
+                )
+
+        interactions = RejectingInteractions()
+        client = SimpleNamespace(interactions=interactions)
+        request_budget = ProviderRequestBudget(10)
+        semaphore = asyncio.Semaphore(3)
+        source = make_source_row("source-1", "task-a")
+        slots = [
+            refinement_slots_for_source(
+                make_source_identity(f"source-{index}", f"task-{index}", index),
+                frozenset(),
+            )[0]
+            for index in range(8)
+        ]
+
+        results = await asyncio.gather(
+            *(
+                refine_slot(
+                    client,
+                    source,
+                    slot,
+                    SOURCE_SCHEMA,
+                    settings(max_attempts=5),
+                    "test-key",
+                    semaphore,
+                    starting_attempt=0,
+                    request_budget=request_budget,
+                )
+                for slot in slots
+            )
+        )
+
+        self.assertEqual(interactions.calls, 10)
+        self.assertEqual(request_budget.used, 10)
+        self.assertEqual(request_budget.remaining, 0)
+        self.assertEqual(sum(len(result.attempts) for result in results), 10)
+        self.assertTrue(any(result.request_budget_exhausted for result in results))
+        self.assertEqual(
+            sorted(
+                attempt["provider_request_number"]
+                for result in results
+                for attempt in result.attempts
+            ),
+            list(range(1, 11)),
+        )
+
+    async def test_worker_scheduler_stops_at_exact_request_cap(self) -> None:
+        class RejectingInteractions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def create(self, **_: object) -> SimpleNamespace:
+                self.calls += 1
+                await asyncio.sleep(0)
+                return SimpleNamespace(output_text="not-json", id=str(self.calls))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = write_source_fixture(root, row_count=4)
+            output_dir = root / "refined"
+            args = worker_args(source_dir, output_dir, target_rows=4)
+            args.no_sync = True
+            args.max_attempts_per_run = 3
+            args.max_provider_requests = 10
+            client = ClosingAsyncClient()
+            interactions = RejectingInteractions()
+            client.interactions = interactions
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+                mock.patch(
+                    "stream_refinement_worker.create_gemini_client",
+                    return_value=SimpleNamespace(aio=client),
+                ),
+            ):
+                exit_code = await async_main(args)
+
+            attempts = [
+                json.loads(line)
+                for line in (output_dir / "attempts.jsonl").read_text().splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(interactions.calls, 10)
+        self.assertEqual(len(attempts), 10)
+        self.assertEqual(
+            sorted(attempt["provider_request_number"] for attempt in attempts),
+            list(range(1, 11)),
+        )
 
     async def test_completed_startup_syncs_without_gemini(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
