@@ -30,7 +30,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from huggingface_hub import sync_bucket
-from publication_pipeline import preflight_publication, write_local_publication
+from publication_pipeline import (
+    preflight_publication,
+    verify_remote_publication,
+    write_local_publication,
+)
 from refinement_pipeline import load_source_manifest
 
 load_dotenv()
@@ -305,7 +309,8 @@ def run(args: argparse.Namespace) -> int:
     )
     print(f"Synchronizing versioned publication to {destination} ...")
     sync_bucket(str(publication_dir), destination)
-    print(f"Publication synchronization complete: {destination}")
+    verify_remote_publication(destination)
+    print(f"Publication synchronization and read-back verification complete: {destination}")
     return 0
 
 
