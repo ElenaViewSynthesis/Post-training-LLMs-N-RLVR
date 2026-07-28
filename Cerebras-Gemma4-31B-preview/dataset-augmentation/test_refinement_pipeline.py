@@ -19,9 +19,11 @@ from refinement_pipeline import (
     conversation_fingerprint,
     ensure_run_manifest,
     ensure_source_manifest,
+    load_local_source_snapshot,
     load_source_identities,
     load_source_manifest,
     load_run_manifest,
+    materialize_local_source_snapshot,
     normalize_conversations,
     pin_source_revision,
     refinement_slots_for_source,
@@ -31,6 +33,7 @@ from refinement_pipeline import (
     stable_synthetic_id,
     validate_refinement_quality,
     verify_refinement_state_inventory,
+    verify_remote_refinement_state,
     verify_source_manifest_content,
     write_accepted_shard,
     write_refinement_state_inventory,
@@ -468,6 +471,76 @@ class RefinementPipelineTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "source files"):
                     verify_source_manifest_content(manifest)
 
+    def test_local_source_snapshot_preserves_canonical_identity_and_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            for index in range(2):
+                pq.write_table(
+                    pa.Table.from_pylist(
+                        [source_row(f"source-{index}", f"task-{index}")],
+                        schema=SOURCE_SCHEMA,
+                    ),
+                    source_dir / f"train-{index:05d}.parquet",
+                )
+            original_schema, original_identities = load_source_identities(
+                str(source_dir)
+            )
+            snapshot_dir = root / "sealed-source"
+
+            snapshot = materialize_local_source_snapshot(
+                str(source_dir), snapshot_dir
+            )
+            loaded = load_local_source_snapshot(snapshot_dir)
+            snapshot_schema, snapshot_identities = load_source_identities(
+                str(snapshot_dir)
+            )
+            source_manifest = ensure_source_manifest(
+                root / "refined/source_manifest.json",
+                requested_source=str(source_dir),
+                resolved_source=str(snapshot_dir),
+                schema=snapshot_schema,
+                identities=snapshot_identities,
+            )
+
+            self.assertEqual(snapshot, loaded)
+            self.assertEqual(original_identities, snapshot_identities)
+            self.assertTrue(
+                original_schema.equals(snapshot_schema, check_metadata=False)
+            )
+            self.assertEqual(
+                source_manifest.source_content_sha256,
+                snapshot.source_content_sha256,
+            )
+            self.assertEqual(
+                [item.path for item in source_manifest.source_files],
+                sorted(str(path) for path in source_dir.glob("*.parquet")),
+            )
+
+    def test_local_source_snapshot_rejects_changed_or_unexpected_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            pq.write_table(
+                pa.Table.from_pylist([source_row("source-1")], schema=SOURCE_SCHEMA),
+                source_dir / "train.parquet",
+            )
+            snapshot_dir = root / "sealed-source"
+            snapshot = materialize_local_source_snapshot(
+                str(source_dir), snapshot_dir
+            )
+            snapshot_file = snapshot_dir / snapshot.files[0].local_name
+
+            snapshot_file.write_bytes(snapshot_file.read_bytes() + b"changed")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                load_local_source_snapshot(snapshot_dir)
+
+            shutil.copy2(source_dir / "train.parquet", snapshot_dir / "unexpected.parquet")
+            with self.assertRaisesRegex(ValueError, "Parquet set mismatch"):
+                load_local_source_snapshot(snapshot_dir, verify_hashes=False)
+
     def test_run_manifests_are_unique_and_freeze_generation_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -561,6 +634,41 @@ class RefinementPipelineTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "unexpected refinement-state file"):
                 verify_refinement_state_inventory(output_dir)
+
+    def test_remote_refinement_verification_reads_back_every_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_dir = root / "source"
+            output_dir = root / "remote-run"
+            source_dir.mkdir()
+            pq.write_table(
+                pa.Table.from_pylist([source_row("source-1")], schema=SOURCE_SCHEMA),
+                source_dir / "train.parquet",
+            )
+            schema, identities = load_source_identities(str(source_dir))
+            source_manifest = ensure_source_manifest(
+                output_dir / "source_manifest.json",
+                requested_source=str(source_dir),
+                resolved_source=str(source_dir),
+                schema=schema,
+                identities=identities,
+            )
+            ensure_run_manifest(
+                output_dir / "run_manifest.json",
+                source_manifest=source_manifest,
+                target_rows=1,
+                model="test-model",
+                generation_config={"max_output_tokens": 512},
+            )
+            entries = write_refinement_state_inventory(output_dir)
+
+            self.assertEqual(
+                verify_remote_refinement_state(str(output_dir)),
+                entries,
+            )
+            (output_dir / "run_manifest.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "UUID mismatch"):
+                verify_remote_refinement_state(str(output_dir))
 
     def test_physical_identity_distinguishes_repeated_logical_ids(self) -> None:
         first = source_row("shared-run", "task-a")
