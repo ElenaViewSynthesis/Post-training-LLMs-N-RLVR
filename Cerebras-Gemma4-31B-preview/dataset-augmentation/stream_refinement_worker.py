@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+import pyarrow.parquet as pq
+
 from refinement_pipeline import (
     ASSIGNMENT_ALGORITHM_VERSION,
     RefinementSlot,
@@ -38,6 +40,7 @@ from refinement_pipeline import (
     iter_source_batches_with_coordinates,
     load_source_identities,
     load_run_manifest,
+    materialize_local_source_snapshot,
     normalize_conversations,
     refinement_slots_for_source,
     remote_run_destination,
@@ -46,6 +49,7 @@ from refinement_pipeline import (
     source_conversation_fingerprint,
     source_identity_for_row,
     validate_refinement_quality,
+    verify_remote_refinement_state,
     verify_refinement_state_inventory,
     write_accepted_shard,
     write_refinement_state_inventory,
@@ -115,10 +119,41 @@ class SlotResult:
     slot: RefinementSlot
     accepted_row: dict[str, Any] | None
     attempts: list[dict[str, Any]]
+    request_budget_exhausted: bool = False
 
 
 class RefinementSyncError(RuntimeError):
     """Raised when the durable refinement backup cannot be synchronized."""
+
+
+class ProviderPreflightError(RuntimeError):
+    """Raised when credentials or model access fail before source scanning."""
+
+
+class ProviderRequestBudget:
+    """Concurrency-safe counter for actual paid generation calls."""
+
+    def __init__(self, limit: int | None) -> None:
+        if limit is not None and limit <= 0:
+            raise ValueError("provider request limit must be positive")
+        self.limit = limit
+        self._used = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def remaining(self) -> int | None:
+        return None if self.limit is None else max(0, self.limit - self._used)
+
+    async def reserve(self) -> int | None:
+        async with self._lock:
+            if self.limit is not None and self._used >= self.limit:
+                return None
+            self._used += 1
+            return self._used
 
 
 def load_environment() -> None:
@@ -152,6 +187,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         type=Path,
         help="Refinement state directory (default: <data-dir>/refined)",
+    )
+    parser.add_argument(
+        "--source-snapshot-dir",
+        type=Path,
+        help=(
+            "Sealed local source snapshot to create/reuse before generation. "
+            "Canonical remote paths remain the source-row identity."
+        ),
     )
     parser.add_argument(
         "--target-rows",
@@ -197,6 +240,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("HF_REFINEMENT_BUCKET", DEFAULT_HF_BUCKET),
     )
     parser.add_argument("--limit", type=_positive_int)
+    parser.add_argument(
+        "--max-provider-requests",
+        type=_positive_int,
+        help=(
+            "Hard cap on actual Gemini generation calls in this invocation, "
+            "including retries. Provider preflight does not consume the cap."
+        ),
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status-only", action="store_true")
     mode.add_argument(
@@ -204,16 +255,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Synchronize existing local refinement state without reading the source or initializing Gemini.",
     )
+    mode.add_argument(
+        "--provider-preflight-only",
+        action="store_true",
+        help="Check Gemini credentials/model access without reading source data or generating content.",
+    )
     parser.add_argument("--no-sync", action="store_true")
     args = parser.parse_args(argv)
     args.data_dir = args.data_dir.expanduser()
     args.output_dir = (args.output_dir or args.data_dir / "refined").expanduser()
+    if args.source_snapshot_dir is not None:
+        args.source_snapshot_dir = args.source_snapshot_dir.expanduser()
     if args.request_batch_size < args.concurrency:
         parser.error("--request-batch-size must be at least --concurrency")
     if args.sync_only and args.no_sync:
         parser.error("--sync-only cannot be combined with --no-sync")
     if args.sync_only and args.limit is not None:
         parser.error("--sync-only cannot be combined with --limit")
+    if args.sync_only and args.max_provider_requests is not None:
+        parser.error("--sync-only cannot be combined with --max-provider-requests")
+    if args.status_only and args.max_provider_requests is not None:
+        parser.error("--status-only cannot be combined with --max-provider-requests")
+    if args.provider_preflight_only and args.max_provider_requests is not None:
+        parser.error(
+            "--provider-preflight-only cannot be combined with --max-provider-requests"
+        )
+    if args.provider_preflight_only and args.limit is not None:
+        parser.error("--provider-preflight-only cannot be combined with --limit")
     return args
 
 
@@ -325,6 +393,7 @@ def _attempt_record(
     fingerprint: str | None = None,
     interaction_id: str | None = None,
     rejection_codes: list[str] | None = None,
+    provider_request_number: int | None = None,
 ) -> dict[str, Any]:
     return {
         "synthetic_id": slot.synthetic_id,
@@ -344,6 +413,7 @@ def _attempt_record(
         "error_code": error_code,
         "conversation_fingerprint": fingerprint,
         "interaction_id": interaction_id,
+        "provider_request_number": provider_request_number,
         "rejection_codes": rejection_codes or [],
         "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
     }
@@ -359,6 +429,7 @@ async def refine_slot(
     semaphore: asyncio.Semaphore,
     starting_attempt: int,
     attempt_budget: int | None = None,
+    request_budget: ProviderRequestBudget | None = None,
 ) -> SlotResult:
     prompt = build_refinement_prompt(source_row, slot)
     attempts: list[dict[str, Any]] = []
@@ -372,6 +443,16 @@ async def refine_slot(
         )
         for offset in range(max_attempts):
             attempt_number = starting_attempt + offset + 1
+            provider_request_number: int | None = None
+            if request_budget is not None:
+                provider_request_number = await request_budget.reserve()
+                if provider_request_number is None:
+                    return SlotResult(
+                        slot,
+                        None,
+                        attempts,
+                        request_budget_exhausted=True,
+                    )
             try:
                 interaction = await client.interactions.create(
                     model=settings.model,
@@ -429,6 +510,7 @@ async def refine_slot(
                             rejection_codes=[
                                 issue.code for issue in quality_issues
                             ],
+                            provider_request_number=provider_request_number,
                         )
                     )
                     continue
@@ -447,6 +529,7 @@ async def refine_slot(
                         status="accepted",
                         fingerprint=fingerprint,
                         interaction_id=getattr(interaction, "id", None),
+                        provider_request_number=provider_request_number,
                     )
                 )
                 return SlotResult(slot, refined_row, attempts)
@@ -464,6 +547,7 @@ async def refine_slot(
                             if isinstance(exc, json.JSONDecodeError)
                             else "invalid_conversation"
                         ],
+                        provider_request_number=provider_request_number,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - provider error boundary
@@ -475,6 +559,7 @@ async def refine_slot(
                         status="provider_error",
                         error=error,
                         error_code=code,
+                        provider_request_number=provider_request_number,
                     )
                 )
                 if code in fatal_codes:
@@ -612,6 +697,7 @@ def sync_output(
         )
         destination = remote_run_destination(bucket, run_manifest)
         sync_bucket(str(output_dir), destination)
+        verify_remote_refinement_state(destination)
     except Exception as exc:
         raise RefinementSyncError(
             f"failed to sync {output_dir} to the isolated run under {bucket}: {exc}"
@@ -628,7 +714,9 @@ def create_gemini_client(api_key: str, settings: Settings) -> Any:
             "api_version": "v1beta",
             "timeout": settings.timeout_ms,
             "retry_options": {
-                "attempts": 5,
+                # Slot-level retries are deliberately the only retry layer so
+                # --max-provider-requests remains an exact HTTP-call ceiling.
+                "attempts": 1,
                 "initial_delay": 1.0,
                 "max_delay": 32.0,
                 "exp_base": 2.0,
@@ -637,6 +725,49 @@ def create_gemini_client(api_key: str, settings: Settings) -> Any:
             },
         },
     )
+
+
+async def provider_preflight(
+    client: Any,
+    settings: Settings,
+    api_key: str,
+) -> None:
+    """Validate credentials and model visibility without a generation call."""
+    try:
+        await client.models.get(model=settings.model)
+    except Exception as exc:  # noqa: BLE001 - provider boundary
+        error, code = _safe_error(exc, api_key)
+        code_text = f" HTTP {code}" if code is not None else ""
+        raise ProviderPreflightError(
+            f"Gemini provider preflight failed{code_text}: {error}"
+        ) from exc
+
+
+def settings_from_args(args: argparse.Namespace) -> Settings:
+    return Settings(
+        model=args.model,
+        concurrency=args.concurrency,
+        request_batch_size=args.request_batch_size,
+        max_output_tokens=args.max_output_tokens,
+        max_attempts_per_run=args.max_attempts_per_run,
+        timeout_ms=args.timeout_seconds * 1_000,
+        sync_every_shards=args.sync_every_shards,
+        hf_bucket=args.hf_bucket,
+        sync_enabled=not args.no_sync,
+    )
+
+
+def local_state_appears_complete(output_dir: Path) -> bool:
+    """Use only immutable shard metadata as a cheap provider-preflight hint."""
+    try:
+        run_manifest = load_run_manifest(output_dir / "run_manifest.json")
+        rows = sum(
+            pq.ParquetFile(shard).metadata.num_rows
+            for shard in (output_dir / "accepted").glob("accepted-*.parquet")
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    return rows == run_manifest.target_rows
 
 
 def write_progress_manifest(
@@ -683,6 +814,19 @@ def generation_config_from_args(args: argparse.Namespace) -> dict[str, int]:
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    if args.provider_preflight_only:
+        settings = settings_from_args(args)
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        client = create_gemini_client(api_key, settings).aio
+        try:
+            await provider_preflight(client, settings, api_key)
+        finally:
+            await client.aclose()
+        print(f"Gemini provider preflight passed for {settings.model}.")
+        return 0
+
     if args.sync_only:
         if not args.output_dir.is_dir():
             raise FileNotFoundError(
@@ -698,11 +842,41 @@ async def async_main(args: argparse.Namespace) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     lock_stream = acquire_run_lock(args.output_dir)
+    client: Any | None = None
     try:
+        settings = settings_from_args(args)
+        api_key = ""
+        if not args.status_only and not local_state_appears_complete(args.output_dir):
+            api_key = os.getenv("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY is not set")
+            client = create_gemini_client(api_key, settings).aio
+            await provider_preflight(client, settings, api_key)
+            print(f"Gemini provider preflight passed for {settings.model}.")
+
         source_manifest_path = args.output_dir / "source_manifest.json"
-        resolved_source = resolve_source_for_run(
-            source_manifest_path, args.original_source
-        )
+        if source_manifest_path.exists():
+            resolved_source = resolve_source_for_run(
+                source_manifest_path, args.original_source
+            )
+            if (
+                args.source_snapshot_dir is not None
+                and Path(resolved_source).resolve()
+                != args.source_snapshot_dir.resolve()
+            ):
+                raise ValueError(
+                    "--source-snapshot-dir conflicts with the immutable source manifest"
+                )
+        elif args.source_snapshot_dir is not None:
+            materialize_local_source_snapshot(
+                args.original_source,
+                args.source_snapshot_dir,
+            )
+            resolved_source = str(args.source_snapshot_dir)
+        else:
+            resolved_source = resolve_source_for_run(
+                source_manifest_path, args.original_source
+            )
         original_schema, identities = load_source_identities(resolved_source)
         source_manifest = ensure_source_manifest(
             source_manifest_path,
@@ -793,23 +967,15 @@ async def async_main(args: argparse.Namespace) -> int:
         if checked_rows != len(identities):
             raise ValueError("source preflight row count changed")
 
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set")
-        settings = Settings(
-            model=args.model,
-            concurrency=args.concurrency,
-            request_batch_size=args.request_batch_size,
-            max_output_tokens=args.max_output_tokens,
-            max_attempts_per_run=args.max_attempts_per_run,
-            timeout_ms=args.timeout_seconds * 1_000,
-            sync_every_shards=args.sync_every_shards,
-            hf_bucket=args.hf_bucket,
-            sync_enabled=not args.no_sync,
-        )
-        sync_client = create_gemini_client(api_key, settings)
-        client = sync_client.aio
+        if client is None:
+            api_key = os.getenv("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                raise RuntimeError("GEMINI_API_KEY is not set")
+            client = create_gemini_client(api_key, settings).aio
+            await provider_preflight(client, settings, api_key)
+            print(f"Gemini provider preflight passed for {settings.model}.")
         semaphore = asyncio.Semaphore(settings.concurrency)
+        request_budget = ProviderRequestBudget(args.max_provider_requests)
         pending = iter_pending_slots(
             resolved_source,
             identities,
@@ -823,6 +989,7 @@ async def async_main(args: argparse.Namespace) -> int:
 
         processed = accepted_this_run = failed_this_run = shard_count = 0
         forced_exit_code = 0
+        budget_exhausted = False
         try:
             while True:
                 request_batch: list[tuple[dict[str, Any], RefinementSlot]] = []
@@ -833,13 +1000,19 @@ async def async_main(args: argparse.Namespace) -> int:
                         < settings.max_attempts_per_run
                     ):
                         request_batch.append((source_row, slot))
+                batch_capacity = settings.request_batch_size - len(request_batch)
+                remaining_request_budget = request_budget.remaining
+                if remaining_request_budget is not None:
+                    batch_capacity = min(batch_capacity, remaining_request_budget)
                 request_batch.extend(
                     itertools.islice(
                         pending,
-                        settings.request_batch_size - len(request_batch),
+                        batch_capacity,
                     )
                 )
                 if not request_batch:
+                    if request_budget.remaining == 0:
+                        budget_exhausted = True
                     break
                 results = await asyncio.gather(
                     *(
@@ -856,6 +1029,7 @@ async def async_main(args: argparse.Namespace) -> int:
                                 settings.max_attempts_per_run
                                 - attempts_used_this_run[slot.synthetic_id]
                             ),
+                            request_budget=request_budget,
                         )
                         for source_row, slot in request_batch
                     )
@@ -896,6 +1070,9 @@ async def async_main(args: argparse.Namespace) -> int:
                 for attempt in all_attempts:
                     attempt_counts[attempt["synthetic_id"]] += 1
                     attempts_used_this_run[attempt["synthetic_id"]] += 1
+
+                if any(result.request_budget_exhausted for result in results):
+                    budget_exhausted = True
 
                 request_by_id = {
                     slot.synthetic_id: (source_row, slot)
@@ -947,6 +1124,12 @@ async def async_main(args: argparse.Namespace) -> int:
                     print("Stopping after a fatal provider/configuration response.")
                     forced_exit_code = 2
                     break
+                if budget_exhausted:
+                    print(
+                        "Stopping after reaching the hard provider request budget "
+                        f"of {request_budget.used:,}."
+                    )
+                    break
                 if batch_accepted == 0:
                     if retry_queue:
                         print(
@@ -964,15 +1147,14 @@ async def async_main(args: argparse.Namespace) -> int:
                     sync_output(args.output_dir, settings.hf_bucket)
                     print(f"Synchronized after {shard_count} new shards.")
         finally:
-            try:
-                await client.aclose()
-            finally:
-                if settings.sync_enabled:
-                    sync_output(args.output_dir, settings.hf_bucket)
-                    print("Final refinement-state synchronization complete.")
+            if settings.sync_enabled:
+                sync_output(args.output_dir, settings.hf_bucket)
+                print("Final refinement-state synchronization complete.")
 
         if forced_exit_code:
             return forced_exit_code
+        if budget_exhausted:
+            return 0
 
         final_remaining = args.target_rows - len(completed)
         if final_remaining and (args.limit is None or failed_this_run):
@@ -982,7 +1164,11 @@ async def async_main(args: argparse.Namespace) -> int:
             return 2
         return 0
     finally:
-        lock_stream.close()
+        try:
+            if client is not None:
+                await client.aclose()
+        finally:
+            lock_stream.close()
 
 
 def main(argv: list[str] | None = None) -> int:
