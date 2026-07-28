@@ -46,6 +46,10 @@ execute them in a live sandbox.
 ## Safety properties
 
 - API calls are concurrent but bounded by `--concurrency`.
+- Gemini credentials and model visibility are checked before a new/incomplete
+  run hashes or scans its source. `--max-provider-requests` is a concurrency-safe
+  ceiling on generation calls, including rejected responses and retries; SDK
+  transport retries are disabled so the ceiling remains exact.
 - Only one worker can own a refinement output directory.
 - Every paid request is assigned to a deterministic source row and slot.
 - A remote source URI is resolved to a full immutable dataset commit before
@@ -68,6 +72,9 @@ execute them in a live sandbox.
 - Refinement backups are sealed by a checksum inventory and complete marker,
   then synchronized only to `runs/<run-instance-id>/`; a fresh output directory
   cannot inherit shards from an earlier run.
+- Every refinement and publication upload is read back from its remote prefix;
+  UUID/manifest markers, complete file sets, byte sizes, and SHA-256 values must
+  match before synchronization is reported as successful.
 - Resume state is derived from accepted Parquet shards, not optimistic counters.
 - Every enabled worker run synchronizes in a finalization path, including fatal
   and incomplete batches; a completed rerun synchronizes without opening Gemini.
@@ -116,6 +123,12 @@ manifest, and read again for complete-row validation. Requests then run in
 bounded batches. Only the active request batch and one accepted output batch
 are held in memory.
 
+For a new or incomplete run, the lightweight provider/model preflight occurs
+before those source scans. A completed run still skips Gemini entirely so it can
+retry synchronization offline. Each real generation call receives a monotonic
+`provider_request_number` in `attempts.jsonl` when a hard request budget is in
+use.
+
 ### Retry and failure classification
 
 Every attempt is recorded in `attempts.jsonl` with a status that determines
@@ -162,17 +175,28 @@ Check status without initializing Gemini:
 uv run python stream_refinement_worker.py --status-only
 ```
 
+Check credentials and model access without reading the source or generating:
+
+```bash
+uv run python stream_refinement_worker.py --provider-preflight-only
+```
+
 Retry synchronization without reading the source or initializing Gemini:
 
 ```bash
 uv run python stream_refinement_worker.py --sync-only
 ```
 
-Make one request without remote synchronization:
+Make exactly one provider request without remote synchronization:
 
 ```bash
-uv run python stream_refinement_worker.py --limit 1 --no-sync
+uv run python stream_refinement_worker.py --max-provider-requests 1 --no-sync
 ```
+
+`--limit` limits assigned slots and is not a request budget because a slot may
+retry. Use `--max-provider-requests` for exact paid-call pilots. Reaching that
+budget is an intentional resumable stop and does not mark unfilled slots as
+failed.
 
 Resume every incomplete slot:
 
@@ -190,9 +214,12 @@ Important options:
 --concurrency
 --request-batch-size
 --max-attempts-per-run
+--max-provider-requests
 --limit
 --status-only
 --sync-only
+--provider-preflight-only
+--source-snapshot-dir
 --no-sync
 ```
 
@@ -233,6 +260,73 @@ Refinement backup destinations are isolated:
 Deleting and recreating a local output directory creates a different UUID and
 therefore a different remote prefix. `--sync-only` loads the existing manifest
 and reuses its original prefix.
+
+### Immutable local source snapshot
+
+Materialize the pinned source once before the production run:
+
+```bash
+uv run python materialize_source_snapshot.py \
+  --source "$ORIGINAL_DATASET_SOURCE" \
+  --snapshot-dir /mnt/c/Users/proxi/pipeline/data/source-snapshot
+```
+
+Verify it later without downloading:
+
+```bash
+uv run python materialize_source_snapshot.py \
+  --snapshot-dir /mnt/c/Users/proxi/pipeline/data/source-snapshot \
+  --verify-only
+```
+
+The snapshot is built in a sibling staging directory and promoted only after
+all Parquet files, the inventory, and the completion marker verify. Its manifest
+retains each pinned remote path, so source-row IDs are identical whether the
+pipeline reads the remote source or the local copy. Generation uses it with:
+
+```bash
+uv run python stream_refinement_worker.py \
+  --source-snapshot-dir /mnt/c/Users/proxi/pipeline/data/source-snapshot
+```
+
+### Supported pilot harness
+
+`refinement_pilot.py` deterministically selects 10–50 rows into its own local
+manifest-v2 fixture. Preparation is offline by default:
+
+```bash
+uv run python refinement_pilot.py --sample-size 10
+```
+
+Real provider access requires the explicit `--execute` flag. The harness always
+passes `--no-sync`, refuses the production refinement/publication directories,
+and writes `pilot_report.json` with acceptance, rejection, provider-error,
+duplicate, attempt-per-slot, and source/refinement sample metrics:
+
+```bash
+uv run python refinement_pilot.py \
+  --sample-size 10 \
+  --max-provider-requests 10 \
+  --pilot-dir /mnt/c/Users/proxi/pipeline/data/pilots/ten-request \
+  --execute
+```
+
+Rebuild a report without provider access with `--report-only`.
+
+### Remote restore drill
+
+After a refinement sync, restore its isolated run into a new directory and
+perform the normal offline status validation:
+
+```bash
+uv run python restore_refinement_run.py \
+  --remote-run "${HF_REFINEMENT_BUCKET}/runs/<run-instance-id>" \
+  --output-dir /mnt/c/Users/proxi/pipeline/data/restore-drill-<run-instance-id>
+```
+
+The drill verifies the remote copy before download, verifies the restored local
+inventory, checks the prefix UUID, and runs `--status-only`. It refuses an
+existing destination.
 
 ## Stage 6: exact publication
 
@@ -277,6 +371,7 @@ Local publication layout:
   publications/
     publication-<content-id>/
       publication_manifest.json
+      publication_complete.json
       data/
         train-00000-of-00050.parquet
         ...
@@ -289,7 +384,9 @@ hf://buckets/borntobeignored/OpenThoughts-Agents-SFT-250k/
   publications/publication-<content-id>/
 ```
 
-Old local or remote shards are never mixed into a new publication.
+Old local or remote shards are never mixed into a new publication. Upload
+success requires a read-back of `publication_manifest.json`,
+`publication_complete.json`, and every declared Parquet checksum.
 `--expected-total-rows` is an optional extra assertion; when omitted, the total
 is derived as the physical source count plus `--expected-new-rows`.
 
@@ -307,16 +404,26 @@ Run the local suite:
 .venv/bin/python -m unittest discover -v
 ```
 
-Before the full paid run:
+Before the full paid run, after replacing the Gemini key:
 
-1. Run all local tests.
-2. Run a generated 10K fixture through assignment, accepted-shard resume, and
-   Stage 6 publication.
-3. Repeat at 100K and 225K while recording wall time and peak RSS.
-4. Run one Gemini request with `--limit 1 --no-sync`.
-5. Inspect its source and refined conversations manually.
-6. Run a controlled 10–50 request pilot.
-7. Resume the full 150K slot assignment only after the pilot passes.
+1. Run `stream_refinement_worker.py --provider-preflight-only`.
+2. Prepare an isolated pilot, then run it with
+   `--max-provider-requests 1 --execute`.
+3. Inspect the source/refinement pair in `pilot_report.json`.
+4. Use a fresh pilot directory for exactly 10 calls.
+5. Expand to 25–50 calls only if the ten-call report warrants it.
+6. Review rejection, duplication, provider-error, and attempts-per-slot metrics.
+7. Materialize and verify the immutable ten-file source snapshot.
+8. Run all local tests and the 10K, 100K, and 225K bounded-memory fixtures.
+9. Start the isolated 150K run against `--source-snapshot-dir` only after those
+   gates pass.
+10. Complete Stage 6 `--dry-run`, local `--no-sync`, remote publication, remote
+    checksum read-back, and a fresh-directory refinement restore drill.
+
+The live checks are intentionally skipped in the default test suite. After the
+key is available, enable provider preflight with
+`RUN_GEMINI_INTEGRATION=1`; enable the single paid integration request only by
+also setting `RUN_GEMINI_PAID_TESTS=1`.
 
 Large generated fixtures belong under `/tmp` and must not be committed.
 
@@ -349,7 +456,9 @@ only for historical compatibility and comparison:
 - `gemma4_31b_agent.py`
 - `gemini_trajectory_worker.py`
 - `validate_n_dedup.py`
-- `run_pilot.py`
+- `run_pilot.py` (executable migration stub; use `refinement_pilot.py`)
 
-Do not start a new full run with those entry points. Existing raw JSONL data is
-left untouched so the migration remains reversible.
+`gemma4_31b_agent.py`, `gemini_trajectory_worker.py`, and `run_pilot.py` exit
+with code `2` before client initialization when executed. Their importable
+historical helpers and existing raw JSONL data remain untouched for audit and
+compatibility purposes.
