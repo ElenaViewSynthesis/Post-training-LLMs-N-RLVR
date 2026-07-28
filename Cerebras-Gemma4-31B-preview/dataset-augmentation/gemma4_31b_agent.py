@@ -31,17 +31,7 @@ Inference backend (set in .env, checked in priority order):
 
 Requires: pip install cerebras-cloud-sdk 'sagemaker<3.0.0' boto3 openai
 """
-import asyncio
-import json
-import os
-from pathlib import Path
 import sys
-
-import boto3
-import pandas as pd
-from dotenv import load_dotenv
-from huggingface_hub import sync_bucket
-from tqdm.asyncio import tqdm as atqdm
 
 if __name__ == "__main__":
     print(
@@ -50,6 +40,17 @@ if __name__ == "__main__":
         file=sys.stderr,
     )
     raise SystemExit(2)
+
+import asyncio
+import json
+import os
+from pathlib import Path
+
+import boto3
+import pandas as pd
+from dotenv import load_dotenv
+from huggingface_hub import sync_bucket
+from tqdm.asyncio import tqdm as atqdm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
