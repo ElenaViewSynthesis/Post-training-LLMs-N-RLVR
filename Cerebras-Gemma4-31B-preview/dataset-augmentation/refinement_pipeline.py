@@ -89,6 +89,9 @@ ASSIGNMENT_ALGORITHM_VERSION = "source-slot-v1"
 SOURCE_MANIFEST_VERSION = 2
 RUN_MANIFEST_VERSION = 1
 STATE_INVENTORY_VERSION = 1
+LOCAL_SOURCE_SNAPSHOT_VERSION = 1
+LOCAL_SOURCE_SNAPSHOT_MANIFEST = "source_snapshot_manifest.json"
+LOCAL_SOURCE_SNAPSHOT_COMPLETE = "source_snapshot_complete.json"
 
 # Calibrated against 173 locally available successful trajectories. Their
 # lowest rewritten-user source-token retention was 5.09%, and the lowest
@@ -586,6 +589,24 @@ class SourceFileManifest:
     sha256: str
 
 
+@dataclass(frozen=True)
+class LocalSourceSnapshotFile:
+    canonical_path: str
+    local_name: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class LocalSourceSnapshot:
+    version: int
+    snapshot_instance_id: str
+    requested_source: str
+    resolved_source: str
+    source_content_sha256: str
+    files: tuple[LocalSourceSnapshotFile, ...]
+
+
 def source_content_digest(files: Sequence[SourceFileManifest]) -> str:
     digest = hashlib.sha256(b"source-content-v1\n")
     for source_file in files:
@@ -598,9 +619,255 @@ def source_content_digest(files: Sequence[SourceFileManifest]) -> str:
     return digest.hexdigest()
 
 
+def _snapshot_source_file_manifests(
+    snapshot: LocalSourceSnapshot,
+) -> tuple[SourceFileManifest, ...]:
+    return tuple(
+        SourceFileManifest(
+            path=item.canonical_path,
+            size=item.size,
+            sha256=item.sha256,
+        )
+        for item in snapshot.files
+    )
+
+
+def load_local_source_snapshot(
+    snapshot_dir: Path,
+    *,
+    verify_hashes: bool = True,
+) -> LocalSourceSnapshot:
+    """Load and verify a sealed local copy of a canonical source revision."""
+    manifest_path = snapshot_dir / LOCAL_SOURCE_SNAPSHOT_MANIFEST
+    complete_path = snapshot_dir / LOCAL_SOURCE_SNAPSHOT_COMPLETE
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"local source snapshot is not atomically sealed: {snapshot_dir}"
+        ) from exc
+    if not isinstance(value, dict) or not isinstance(complete, dict):
+        raise ValueError(f"local source snapshot metadata is malformed: {snapshot_dir}")
+    try:
+        raw_files = value["files"]
+        if not isinstance(raw_files, list):
+            raise TypeError("files is not a list")
+        files = tuple(
+            LocalSourceSnapshotFile(
+                canonical_path=item["canonical_path"],
+                local_name=item["local_name"],
+                size=item["size"],
+                sha256=item["sha256"],
+            )
+            for item in raw_files
+            if isinstance(item, dict)
+        )
+        if len(files) != len(raw_files):
+            raise TypeError("files contains a non-object")
+        snapshot = LocalSourceSnapshot(
+            version=value["version"],
+            snapshot_instance_id=value["snapshot_instance_id"],
+            requested_source=value["requested_source"],
+            resolved_source=value["resolved_source"],
+            source_content_sha256=value["source_content_sha256"],
+            files=files,
+        )
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"local source snapshot manifest is malformed: {manifest_path}"
+        ) from exc
+
+    canonical_paths = [item.canonical_path for item in snapshot.files]
+    local_names = [item.local_name for item in snapshot.files]
+    if (
+        snapshot.version != LOCAL_SOURCE_SNAPSHOT_VERSION
+        or not isinstance(snapshot.snapshot_instance_id, str)
+        or not snapshot.snapshot_instance_id
+        or not isinstance(snapshot.requested_source, str)
+        or not snapshot.requested_source
+        or not isinstance(snapshot.resolved_source, str)
+        or not snapshot.resolved_source
+        or not snapshot.files
+        or canonical_paths != sorted(canonical_paths)
+        or len(canonical_paths) != len(set(canonical_paths))
+        or len(local_names) != len(set(local_names))
+        or any(
+            not isinstance(item.canonical_path, str)
+            or not item.canonical_path.endswith(".parquet")
+            or not isinstance(item.local_name, str)
+            or Path(item.local_name).name != item.local_name
+            or not item.local_name.endswith(".parquet")
+            or not isinstance(item.size, int)
+            or item.size <= 0
+            or not _is_sha256(item.sha256)
+            for item in snapshot.files
+        )
+        or not _is_sha256(snapshot.source_content_sha256)
+        or source_content_digest(_snapshot_source_file_manifests(snapshot))
+        != snapshot.source_content_sha256
+    ):
+        raise ValueError(f"local source snapshot contains invalid values: {snapshot_dir}")
+
+    if (
+        complete.get("version") != LOCAL_SOURCE_SNAPSHOT_VERSION
+        or complete.get("snapshot_instance_id") != snapshot.snapshot_instance_id
+        or complete.get("manifest_sha256") != _file_sha256(manifest_path)
+        or complete.get("file_count") != len(snapshot.files)
+        or complete.get("source_content_sha256")
+        != snapshot.source_content_sha256
+    ):
+        raise ValueError(
+            f"local source snapshot marker does not match its inventory: {snapshot_dir}"
+        )
+
+    expected_names = set(local_names)
+    actual_names = {path.name for path in snapshot_dir.glob("*.parquet")}
+    if actual_names != expected_names:
+        raise ValueError(
+            "local source snapshot Parquet set mismatch: "
+            f"missing={sorted(expected_names - actual_names)[:3]}, "
+            f"unexpected={sorted(actual_names - expected_names)[:3]}"
+        )
+    for item in snapshot.files:
+        path = snapshot_dir / item.local_name
+        if path.stat().st_size != item.size or (
+            verify_hashes and _file_sha256(path) != item.sha256
+        ):
+            raise ValueError(
+                f"local source snapshot checksum mismatch: {item.local_name}"
+            )
+    return snapshot
+
+
+def materialize_local_source_snapshot(
+    source: str,
+    snapshot_dir: Path,
+) -> LocalSourceSnapshot:
+    """Download, checksum, and atomically seal one immutable local source copy."""
+    snapshot_dir = snapshot_dir.expanduser()
+    if snapshot_dir.exists():
+        snapshot = load_local_source_snapshot(snapshot_dir)
+        if source not in {snapshot.requested_source, snapshot.resolved_source}:
+            raise ValueError(
+                "existing local source snapshot belongs to a different source"
+            )
+        return snapshot
+
+    resolved_source = pin_source_revision(source)
+    filesystem, remote_files = resolve_parquet_source(resolved_source)
+    parent = snapshot_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{snapshot_dir.name}.staging-", dir=parent)
+    )
+    try:
+        staged_files: list[LocalSourceSnapshotFile] = []
+        for index, remote_path in enumerate(sorted(str(path) for path in remote_files)):
+            basename = Path(remote_path).name
+            local_name = f"source-{index:05d}-{basename}"
+            destination = staging / local_name
+            temporary = staging / f".{local_name}.part"
+            digest = hashlib.sha256()
+            size = 0
+            with filesystem.open(remote_path, "rb") as source_stream:
+                with temporary.open("wb") as destination_stream:
+                    while chunk := source_stream.read(1_048_576):
+                        destination_stream.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                    destination_stream.flush()
+                    os.fsync(destination_stream.fileno())
+            if size <= 0:
+                raise ValueError(f"source file is empty: {remote_path}")
+            os.replace(temporary, destination)
+            staged_files.append(
+                LocalSourceSnapshotFile(
+                    canonical_path=remote_path,
+                    local_name=local_name,
+                    size=size,
+                    sha256=digest.hexdigest(),
+                )
+            )
+
+        staged_files.sort(key=lambda item: item.canonical_path)
+        snapshot = LocalSourceSnapshot(
+            version=LOCAL_SOURCE_SNAPSHOT_VERSION,
+            snapshot_instance_id=str(uuid.uuid4()),
+            requested_source=source,
+            resolved_source=resolved_source,
+            source_content_sha256=source_content_digest(
+                tuple(
+                    SourceFileManifest(item.canonical_path, item.size, item.sha256)
+                    for item in staged_files
+                )
+            ),
+            files=tuple(staged_files),
+        )
+        manifest_path = staging / LOCAL_SOURCE_SNAPSHOT_MANIFEST
+        _atomic_write_json(manifest_path, asdict(snapshot))
+        _atomic_write_json(
+            staging / LOCAL_SOURCE_SNAPSHOT_COMPLETE,
+            {
+                "version": LOCAL_SOURCE_SNAPSHOT_VERSION,
+                "snapshot_instance_id": snapshot.snapshot_instance_id,
+                "manifest_sha256": _file_sha256(manifest_path),
+                "file_count": len(snapshot.files),
+                "source_content_sha256": snapshot.source_content_sha256,
+            },
+        )
+        load_local_source_snapshot(staging)
+        try:
+            os.replace(staging, snapshot_dir)
+        except OSError:
+            if not snapshot_dir.exists():
+                raise
+            concurrent = load_local_source_snapshot(snapshot_dir)
+            if (
+                concurrent.requested_source != source
+                or concurrent.resolved_source != resolved_source
+                or concurrent.source_content_sha256 != snapshot.source_content_sha256
+            ):
+                raise ValueError(
+                    "concurrently created local source snapshot does not match"
+                )
+            return concurrent
+        return load_local_source_snapshot(snapshot_dir)
+    finally:
+        if staging.exists():
+            for path in sorted(staging.iterdir()):
+                if path.is_file():
+                    path.unlink()
+            staging.rmdir()
+
+
+def _local_snapshot_canonical_paths(
+    source: str,
+    files: Sequence[str],
+) -> dict[str, str]:
+    source_path = Path(source).expanduser()
+    if not source_path.is_dir() or not (
+        source_path / LOCAL_SOURCE_SNAPSHOT_MANIFEST
+    ).exists():
+        return {}
+    snapshot = load_local_source_snapshot(source_path, verify_hashes=False)
+    canonical_by_name = {
+        item.local_name: item.canonical_path for item in snapshot.files
+    }
+    mapping = {
+        str(path): canonical_by_name[Path(str(path)).name]
+        for path in files
+        if Path(str(path)).name in canonical_by_name
+    }
+    if len(mapping) != len(files):
+        raise ValueError("local source snapshot file mapping is incomplete")
+    return mapping
+
+
 def snapshot_source_files(source: str) -> tuple[SourceFileManifest, ...]:
     """Hash every resolved Parquet byte so non-identity mutations are visible."""
     filesystem, files = resolve_parquet_source(source)
+    canonical_paths = _local_snapshot_canonical_paths(source, files)
     snapshots: list[SourceFileManifest] = []
     for source_path in sorted(str(path) for path in files):
         digest = hashlib.sha256()
@@ -611,7 +878,7 @@ def snapshot_source_files(source: str) -> tuple[SourceFileManifest, ...]:
                 size += len(chunk)
         snapshots.append(
             SourceFileManifest(
-                path=source_path,
+                path=canonical_paths.get(source_path, source_path),
                 size=size,
                 sha256=digest.hexdigest(),
             )
@@ -1011,6 +1278,95 @@ def verify_refinement_state_inventory(
     return entries
 
 
+def _remote_sha256(filesystem: Any, path: str) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with filesystem.open(path, "rb") as stream:
+        while chunk := stream.read(1_048_576):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def verify_remote_refinement_state(remote_run: str) -> dict[str, dict[str, Any]]:
+    """Read back and checksum every file in a synchronized refinement run."""
+    filesystem, root = fsspec.core.url_to_fs(remote_run)
+    root = root.rstrip("/")
+
+    def remote_path(relative: str) -> str:
+        return f"{root}/{relative}"
+
+    try:
+        inventory_bytes = filesystem.cat_file(
+            remote_path("checksum_inventory.json")
+        )
+        complete_bytes = filesystem.cat_file(remote_path("complete.json"))
+        run_manifest_bytes = filesystem.cat_file(remote_path("run_manifest.json"))
+        inventory = json.loads(inventory_bytes)
+        complete = json.loads(complete_bytes)
+        run_manifest = json.loads(run_manifest_bytes)
+    except Exception as exc:  # noqa: BLE001 - remote filesystem boundary
+        raise ValueError(
+            f"remote refinement metadata could not be read: {remote_run}"
+        ) from exc
+    if not all(isinstance(value, dict) for value in (inventory, complete, run_manifest)):
+        raise ValueError("remote refinement metadata is malformed")
+    run_instance_id = run_manifest.get("run_instance_id")
+    if (
+        inventory.get("version") != STATE_INVENTORY_VERSION
+        or complete.get("version") != STATE_INVENTORY_VERSION
+        or not isinstance(run_instance_id, str)
+        or inventory.get("run_instance_id") != run_instance_id
+        or complete.get("run_instance_id") != run_instance_id
+        or complete.get("inventory_sha256")
+        != hashlib.sha256(inventory_bytes).hexdigest()
+    ):
+        raise ValueError("remote refinement inventory/marker/run UUID mismatch")
+
+    raw_entries = inventory.get("files")
+    if not isinstance(raw_entries, list) or any(
+        not isinstance(entry, dict) for entry in raw_entries
+    ):
+        raise ValueError("remote refinement inventory contains invalid entries")
+    entries: dict[str, dict[str, Any]] = {}
+    for entry in raw_entries:
+        relative = entry.get("path")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or relative in entries
+            or not isinstance(entry.get("size"), int)
+            or entry["size"] < 0
+            or not _is_sha256(entry.get("sha256"))
+        ):
+            raise ValueError("remote refinement inventory contains an invalid entry")
+        entries[relative] = entry
+    if complete.get("file_count") != len(entries):
+        raise ValueError("remote refinement marker has an invalid file count")
+    expected_files = set(entries) | {"checksum_inventory.json", "complete.json"}
+    try:
+        actual_files = {
+            str(path)[len(root) + 1 :]
+            for path in filesystem.find(root)
+            if str(path) != root and not filesystem.isdir(path)
+        }
+    except Exception as exc:  # noqa: BLE001 - remote listing boundary
+        raise ValueError("remote refinement file listing failed") from exc
+    if actual_files != expected_files:
+        raise ValueError(
+            "remote refinement file set mismatch: "
+            f"missing={sorted(expected_files - actual_files)[:3]}, "
+            f"unexpected={sorted(actual_files - expected_files)[:3]}"
+        )
+    for relative, entry in entries.items():
+        size, sha256 = _remote_sha256(filesystem, remote_path(relative))
+        if size != entry["size"] or sha256 != entry["sha256"]:
+            raise ValueError(f"remote refinement checksum mismatch: {relative}")
+    return entries
+
+
 def choose_secondary_source_ids(
     source_record_ids: Sequence[str], target_rows: int
 ) -> frozenset[str]:
@@ -1115,6 +1471,7 @@ def iter_source_batches_with_coordinates(
 ) -> Iterator[tuple[str, int, pa.RecordBatch]]:
     """Yield each batch with its source file and first physical row index."""
     filesystem, files = resolve_parquet_source(source)
+    canonical_paths = _local_snapshot_canonical_paths(source, files)
     for path in files:
         row_offset = 0
         with filesystem.open(path, "rb") as stream:
@@ -1123,7 +1480,8 @@ def iter_source_batches_with_coordinates(
                 batch_size=batch_size,
                 columns=list(columns) if columns is not None else None,
             ):
-                yield str(path), row_offset, batch
+                source_path = str(path)
+                yield canonical_paths.get(source_path, source_path), row_offset, batch
                 row_offset += batch.num_rows
 
 
