@@ -1,12 +1,10 @@
-# Dataset augmentation: next steps and resume runbook
+# Dataset augmentation: archived oversampling runbook
 
-> **Architecture update:** The 225,000-candidate oversampling workflow described
-> below has been superseded by `stream_refinement_worker.py`. The current path
-> assigns exactly 150,000 deterministic source-row refinement slots, retries a
-> rejected result for its original slot, and stores only the first accepted
-> result. See `README.md` for current commands. The historical details below are
-> retained as a record of the earlier design and must not be used to start a new
-> paid run.
+> **Do not execute commands in this historical document.** The 225,000-candidate
+> oversampling workflow below has been superseded by
+> `stream_refinement_worker.py`; its paid entry points now exit with an error.
+> See `README.md` for the immutable source snapshot, exact provider budgets,
+> supported pilot, isolated production run, restore drill, and Stage 6 commands.
 
 This document is the handoff point for a fresh Codex session. It records the
 authoritative pipeline state, the remaining implementation work, the required
@@ -87,19 +85,16 @@ The left/right count should be `0 0`. Do not merge or pull automatically if it
 is not; inspect the divergence and the working tree first. The known sibling
 changes listed above may still appear in `git status` and must be ignored.
 
-Confirm the authoritative resume count without contacting Gemini:
+For a current assigned-slot run, confirm local status without contacting Gemini:
 
 ```bash
-uv run python gemini_trajectory_worker.py \
+uv run python stream_refinement_worker.py \
   --data-dir /mnt/c/Users/proxi/pipeline/data \
   --status-only
 ```
 
-Expected baseline:
-
-```text
-Plan: 225,000 | successful: 169 | remaining: 224,831 | existing records: 511 | malformed lines: 0
-```
+The accepted count is reconstructed from validated Parquet shards. The legacy
+JSONL baseline below is retained only as audit history.
 
 ## Implementation order
 
