@@ -49,7 +49,6 @@ from refinement_pipeline import (
     normalize_conversations,
     refinement_slots_for_source,
     scan_accepted_shards,
-    source_conversation_fingerprint,
     source_identity_for_row,
     validate_refinement_quality,
     verify_refinement_state_inventory,
@@ -65,7 +64,7 @@ DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_AGENT_CALLS = 1
 MAX_BATCH_SIZE = 8
 CODEX_PROVIDER = "openai-codex-cli-chatgpt"
-CODEX_VALIDATION_POLICY_VERSION = "codex-quality-v1"
+CODEX_VALIDATION_POLICY_VERSION = "codex-quality-v2-warn"
 
 SYSTEM_INSTRUCTIONS = """Role: expert software-agent dataset editor.
 
@@ -648,6 +647,7 @@ def _attempt_record(
     error: str | None = None,
     fingerprint: str | None = None,
     rejection_codes: Sequence[str] = (),
+    quality_warnings: Sequence[RefinementQualityIssue] = (),
 ) -> dict[str, Any]:
     slot = item.slot
     return {
@@ -671,6 +671,10 @@ def _attempt_record(
         "codex_cli_version": runtime.version,
         "usage": dict(usage or {}),
         "rejection_codes": list(rejection_codes),
+        "quality_warning_codes": [issue.code for issue in quality_warnings],
+        "quality_warnings": [
+            f"{issue.code}: {issue.detail}" for issue in quality_warnings
+        ],
         "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
         "codex_validation_policy": CODEX_VALIDATION_POLICY_VERSION,
     }
@@ -799,25 +803,6 @@ async def process_batch(
                     item.source_row.get("conversations"), conversations
                 ),
             )
-            if issues:
-                fingerprint = source_conversation_fingerprint(conversations)
-                attempt = _attempt_record(
-                    item,
-                    attempt_number,
-                    agent_call_number,
-                    status="rejected",
-                    runtime=runtime,
-                    thread_id=response.thread_id,
-                    usage=response.usage,
-                    error="; ".join(
-                        f"{issue.code}: {issue.detail}" for issue in issues
-                    ),
-                    fingerprint=fingerprint,
-                    rejection_codes=tuple(issue.code for issue in issues),
-                )
-                attempts.append(attempt)
-                incomplete.append(item)
-                continue
             fingerprint = conversation_fingerprint(conversations)
             row = build_refined_row(
                 item.source_row,
@@ -836,6 +821,7 @@ async def process_batch(
                 thread_id=response.thread_id,
                 usage=response.usage,
                 fingerprint=fingerprint,
+                quality_warnings=issues,
             )
             attempts.append(attempt)
             candidates.append(Candidate(item, row, attempt))

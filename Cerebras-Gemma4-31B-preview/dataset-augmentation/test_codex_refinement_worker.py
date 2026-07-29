@@ -209,7 +209,7 @@ class CodexRefinementWorkerTests(unittest.TestCase):
 
         self.assertEqual(validate_codex_trajectory_quality(source, candidate), ())
 
-    def test_process_batch_applies_codex_policy(self) -> None:
+    def test_process_batch_records_codex_policy_as_nonblocking_warnings(self) -> None:
         source = [
             {"role": "user", "content": "Inspect the repository"},
             {"role": "assistant", "content": "Inspection complete"},
@@ -255,15 +255,80 @@ class CodexRefinementWorkerTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result.candidates, [])
-        self.assertEqual(result.incomplete, [item])
-        codes = set(result.attempts[0]["rejection_codes"])
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.incomplete, [])
+        self.assertEqual(result.attempts[0]["status"], "accepted")
+        self.assertEqual(result.attempts[0]["rejection_codes"], [])
+        codes = set(result.attempts[0]["quality_warning_codes"])
         self.assertTrue(
             {"added_deliverable", "adjacent_same_role", "vague_completion"}
             <= codes
         )
         self.assertEqual(
-            result.attempts[0]["codex_validation_policy"], "codex-quality-v1"
+            result.attempts[0]["codex_validation_policy"],
+            "codex-quality-v2-warn",
+        )
+
+    def test_process_batch_accepts_low_task_retention_with_warning(self) -> None:
+        source = [
+            {
+                "role": "user",
+                "content": (
+                    "Fix the authentication regression in src/server.py and run "
+                    "the targeted pytest command"
+                ),
+            },
+            {"role": "assistant", "content": "I will inspect src/server.py."},
+        ]
+        item = pending_item(source)
+        candidate = [
+            {
+                "role": "user",
+                "content": (
+                    "Fix the authentication regression in src/server.py and run "
+                    "the targeted pytest command"
+                ),
+            },
+            {"role": "assistant", "content": "Completed successfully."},
+        ]
+        response = CodexResponse(
+            payload={
+                "results": [
+                    {
+                        "synthetic_id": item.slot.synthetic_id,
+                        "conversations": candidate,
+                    }
+                ]
+            },
+            thread_id="thread-1",
+            usage={"input_tokens": 10, "output_tokens": 5},
+        )
+        runtime = CodexRuntime(
+            executable="codex", version="codex 1.0", environment={}
+        )
+
+        with mock.patch(
+            "codex_refinement_worker.invoke_codex",
+            new=mock.AsyncMock(return_value=response),
+        ):
+            result = asyncio.run(
+                process_batch(
+                    runtime,
+                    model="gpt-5.6-sol",
+                    items=[item],
+                    attempt_numbers={item.slot.synthetic_id: 1},
+                    agent_call_number=1,
+                    timeout_seconds=60,
+                    original_schema=SOURCE_SCHEMA,
+                )
+            )
+
+        self.assertEqual(len(result.candidates), 1)
+        self.assertEqual(result.incomplete, [])
+        self.assertEqual(result.attempts[0]["status"], "accepted")
+        self.assertEqual(result.attempts[0]["rejection_codes"], [])
+        self.assertIn(
+            "task_drift", result.attempts[0]["quality_warning_codes"]
         )
 
 
