@@ -289,6 +289,114 @@ uv run python stream_refinement_worker.py \
   --source-snapshot-dir /mnt/c/Users/proxi/pipeline/data/source-snapshot
 ```
 
+### Codex production refinement and tmux operation
+
+`codex_refinement_worker.py` is the ChatGPT-authenticated alternative refinement
+worker. It retains deterministic source-slot ownership in Python and uses one
+bounded `codex exec` subprocess as the specialist for each micro-batch. The
+worker, rather than tmux or Codex, owns row identity, validation, retries,
+accepted-shard promotion, progress, and checksum sealing.
+
+Check the saved ChatGPT login without scanning the dataset or making a model
+call:
+
+```bash
+.venv/bin/python codex_refinement_worker.py --preflight-only
+```
+
+The worker creates a fresh temporary directory and a batch-specific JSON Schema
+for every call. Its native subprocess is equivalent to the command below. The
+trailing `-` is required because the generated batch prompt is supplied on
+standard input. Do not reuse a prior `/tmp/codex-refinement-call-*` schema: its
+`synthetic_id` enum is valid for exactly one micro-batch and the worker removes
+the temporary directory after the call.
+
+```bash
+codex exec \
+  --json \
+  --ephemeral \
+  --ignore-user-config \
+  --sandbox read-only \
+  --skip-git-repo-check \
+  --color never \
+  --model gpt-5.6-sol \
+  --output-schema /tmp/codex-refinement-call-XXXXXXXX/output-schema.json \
+  -
+```
+
+For an unattended production run, use the checked wrapper. It preserves the
+worker's immutable configuration, gives each invocation a large explicit call
+budget, and relaunches only when that budget ends successfully before the row
+target. A nonzero worker exit stops the wrapper so configuration, authentication,
+or state-integrity failures do not become an infinite restart loop.
+
+```bash
+export PIPELINE_DATA_DIR=/mnt/c/Users/proxi/pipeline/data
+export CODEX_REFINEMENT_MODEL=gpt-5.6-sol
+export CODEX_REFINEMENT_OUTPUT_DIR="$PIPELINE_DATA_DIR/codex-refined"
+export CODEX_REFINEMENT_BATCH_SIZE=4
+export CODEX_REFINEMENT_CONCURRENCY=1
+export CODEX_MAX_AGENT_CALLS_PER_INVOCATION=100000
+
+./run_codex_refinement_loop.sh
+```
+
+Run the same resumable loop in tmux and keep a durable operator log:
+
+```bash
+augmentation_dir="$(pwd)"
+production_session=codex-refinement-production
+production_log="$PIPELINE_DATA_DIR/codex-refined-production.log"
+
+tmux new-session -d -s "$production_session" \
+  "cd '$augmentation_dir' && \
+  exec env PYTHONUNBUFFERED=1 ./run_codex_refinement_loop.sh \
+  >> '$production_log' 2>&1"
+```
+
+Inspect the session, recent output, native Codex child, and durable row count:
+
+```bash
+tmux has-session -t "$production_session"
+tmux capture-pane -p -t "$production_session" -S -80
+tail -n 80 "$production_log"
+ps -C codex -o pid=,ppid=,etimes=,stat=,args=
+sed -n '/completed_rows\|remaining_rows\|target_rows/p' \
+  "$CODEX_REFINEMENT_OUTPUT_DIR/progress.json"
+```
+
+If the tmux server or host exits, rerun the same `tmux new-session` command.
+The worker validates the sealed manifests and accepted Parquet shards before
+selecting the next incomplete source slot. It never infers completion from the
+log or from an in-flight `codex exec` process.
+
+Synchronize accepted rows independently every time another 10-row threshold is
+sealed:
+
+```bash
+checkpoint_session=codex-refinement-hf-checkpoints
+checkpoint_log="$PIPELINE_DATA_DIR/codex-refined-hf-checkpoints.log"
+
+tmux new-session -d -s "$checkpoint_session" \
+  "cd '$augmentation_dir' && \
+  exec env PYTHONUNBUFFERED=1 .venv/bin/python codex_hf_checkpoint_sidecar.py \
+  --output-dir '$CODEX_REFINEMENT_OUTPUT_DIR' --checkpoint-rows 10 \
+  >> '$checkpoint_log' 2>&1"
+```
+
+The sidecar never locks, changes, or restarts the production worker. It uploads
+only newly sealed immutable Parquet shards, verifies their remote SHA-256 values,
+commits a chained checkpoint marker, and then updates `latest.json`. Its local
+cursor is stored beside the production output in
+`codex-refined-hf-checkpoints/state.json`; remote checkpoints are isolated at:
+
+```text
+<hf-refinement-bucket>/checkpoints/runs/<run-instance-id>/
+```
+
+This checkpoint namespace is a recovery stream for accepted synthetic rows. It
+is separate from the final Stage 6 publication and never deletes remote files.
+
 ### Supported pilot harness
 
 `refinement_pilot.py` deterministically selects 10–50 rows into its own local
