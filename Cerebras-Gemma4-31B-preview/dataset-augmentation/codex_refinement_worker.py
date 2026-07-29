@@ -19,6 +19,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ from typing import Any, TextIO
 from refinement_pipeline import (
     ASSIGNMENT_ALGORITHM_VERSION,
     REFINEMENT_VALIDATION_POLICY_VERSION,
+    RefinementQualityIssue,
     RefinementSlot,
     SourceIdentity,
     build_augmented_schema,
@@ -58,27 +60,56 @@ from refinement_pipeline import (
 
 DEFAULT_DATA_DIR = Path("~/pipeline/data")
 DEFAULT_TARGET_ROWS = 150_000
-DEFAULT_BATCH_SIZE = 2
+DEFAULT_BATCH_SIZE = 4
 DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_AGENT_CALLS = 1
 MAX_BATCH_SIZE = 8
 CODEX_PROVIDER = "openai-codex-cli-chatgpt"
+CODEX_VALIDATION_POLICY_VERSION = "codex-quality-v1"
 
-SYSTEM_INSTRUCTIONS = """You are an expert software-agent dataset editor.
-This is a text transformation task only. Do not inspect files, run commands,
-browse, call tools, or access the network.
+SYSTEM_INSTRUCTIONS = """Role: expert software-agent dataset editor.
 
-For every supplied item, create one distinct, high-quality software-agent
-trajectory for the same task and outcome. Preserve paths, identifiers,
-commands, URLs, quoted strings, numbers, and other task-critical details.
-Improve clarity, reasoning flow, useful intermediate detail, and consistency
-between assistant actions and tool observations. Do not claim real execution
-beyond what the source conversation supports. Keep 2-40 non-empty role/content
-turns, include user and assistant participation, keep tool observations paired
-with assistant actions, and end with an assistant completion summary.
+Goal: for every input item, produce one distinct, higher-quality trajectory for
+the exact same task, requested deliverable, and supported outcome.
 
-Return exactly one result for every supplied synthetic_id and only return data
-that matches the requested JSON schema."""
+Success criteria:
+- Preserve paths, identifiers, commands, URLs, quoted strings, numbers, tool
+  evidence, concrete findings, and other task-critical details.
+- Improve clarity, reasoning flow, useful intermediate detail, and consistency
+  between assistant actions and tool observations.
+- Retain source tool evidence as tool turns; do not replace concrete evidence
+  or findings with generic claims that inspection or work was completed.
+- Use 2-40 non-empty turns with user and assistant participation, valid tool
+  ordering, no adjacent system/user/assistant turns with the same role, and a
+  final assistant summary containing concrete, source-supported outcomes.
+
+Constraints: this is text transformation only. Do not inspect files, run
+commands, browse, call tools, or access the network. Do not add a summary,
+report, explanation, recommendation, comparison, documentation, or any other
+deliverable absent from the source request. Do not invent execution or results.
+
+Output exactly one result for every supplied synthetic_id and only data that
+matches the requested JSON schema."""
+
+_DELIVERABLE_CONCEPTS = {
+    "summary": ("summary", "summarize", "summarise"),
+    "report": ("report",),
+    "explanation": ("explain", "explanation"),
+    "recommendation": ("recommend", "recommendation"),
+    "comparison": ("compare", "comparison"),
+    "documentation": ("document", "documentation"),
+}
+_VAGUE_COMPLETION_PATTERN = re.compile(
+    r"\b(?:inspection|review|task|work|implementation) "
+    r"(?:is|was|has been) (?:complete|completed)\b|"
+    r"\b(?:identified|reviewed) (?:the )?(?:main|key|necessary)\b",
+    re.IGNORECASE,
+)
+_CONCRETE_EVIDENCE_PATTERN = re.compile(
+    r"`[^`]+`|https?://|(?:^|\s)(?:\.?\.?/|~/)[^\s]+|"
+    r"--[A-Za-z0-9-]+|\b[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,8}\b|\d",
+    re.IGNORECASE,
+)
 
 CONVERSATION_SCHEMA: dict[str, Any] = {
     "type": "array",
@@ -135,6 +166,82 @@ class BatchResult:
 
 class CodexInvocationError(RuntimeError):
     """A bounded Codex subprocess did not produce a usable final response."""
+
+
+def validate_codex_trajectory_quality(
+    source_conversations: Any,
+    candidate_conversations: Any,
+) -> tuple[RefinementQualityIssue, ...]:
+    """Apply Codex-only checks without changing Gemini/Cerebras quality-v1."""
+    source = normalize_conversations(
+        source_conversations,
+        require_nonempty_content=False,
+        require_final_assistant=False,
+        min_turns=1,
+        max_turns=None,
+    )
+    candidate = normalize_conversations(
+        candidate_conversations,
+        require_final_assistant=False,
+    )
+    issues: dict[str, RefinementQualityIssue] = {}
+
+    def reject(code: str, detail: str) -> None:
+        issues.setdefault(code, RefinementQualityIssue(code, detail))
+
+    roles = [turn["role"] for turn in candidate]
+    for index, (left, right) in enumerate(zip(roles, roles[1:], strict=False)):
+        if left == right and left in {"system", "user", "assistant"}:
+            reject(
+                "adjacent_same_role",
+                f"candidate repeats role {left!r} at turns {index} and {index + 1}",
+            )
+
+    source_roles = {turn["role"] for turn in source}
+    if "tool" in source_roles and "tool" not in roles:
+        reject(
+            "missing_tool_evidence",
+            "candidate removes every tool observation from a tool-grounded source",
+        )
+
+    source_user = " ".join(
+        turn["content"].casefold() for turn in source if turn["role"] == "user"
+    )
+    candidate_user = " ".join(
+        turn["content"].casefold()
+        for turn in candidate
+        if turn["role"] == "user"
+    )
+    added_deliverables = [
+        concept
+        for concept, forms in _DELIVERABLE_CONCEPTS.items()
+        if any(re.search(rf"\b{re.escape(form)}\w*\b", candidate_user) for form in forms)
+        and not any(re.search(rf"\b{re.escape(form)}\w*\b", source_user) for form in forms)
+    ]
+    if added_deliverables:
+        reject(
+            "added_deliverable",
+            "candidate adds deliverables absent from the source request: "
+            + ", ".join(added_deliverables),
+        )
+
+    final_assistant = next(
+        (
+            turn["content"]
+            for turn in reversed(candidate)
+            if turn["role"] == "assistant"
+        ),
+        "",
+    )
+    if (
+        _VAGUE_COMPLETION_PATTERN.search(final_assistant)
+        and not _CONCRETE_EVIDENCE_PATTERN.search(final_assistant)
+    ):
+        reject(
+            "vague_completion",
+            "final assistant claims completion/findings without a concrete artifact or value",
+        )
+    return tuple(issues.values())
 
 
 def _positive_int(value: str) -> int:
@@ -538,6 +645,7 @@ def _attempt_record(
         "usage": dict(usage or {}),
         "rejection_codes": list(rejection_codes),
         "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
+        "codex_validation_policy": CODEX_VALIDATION_POLICY_VERSION,
     }
 
 
@@ -656,8 +764,13 @@ async def process_batch(
                 by_id[item.slot.synthetic_id].get("conversations"),
                 require_final_assistant=False,
             )
-            issues = validate_refinement_quality(
-                item.source_row.get("conversations"), conversations
+            issues = (
+                *validate_refinement_quality(
+                    item.source_row.get("conversations"), conversations
+                ),
+                *validate_codex_trajectory_quality(
+                    item.source_row.get("conversations"), conversations
+                ),
             )
             if issues:
                 fingerprint = source_conversation_fingerprint(conversations)
@@ -821,6 +934,7 @@ def write_progress(
         "source_content_sha256": source_content_sha256,
         "assignment": ASSIGNMENT_ALGORITHM_VERSION,
         "validation_policy": REFINEMENT_VALIDATION_POLICY_VERSION,
+        "codex_validation_policy": CODEX_VALIDATION_POLICY_VERSION,
         "synchronization": "disabled",
     }
     output_dir.mkdir(parents=True, exist_ok=True)
