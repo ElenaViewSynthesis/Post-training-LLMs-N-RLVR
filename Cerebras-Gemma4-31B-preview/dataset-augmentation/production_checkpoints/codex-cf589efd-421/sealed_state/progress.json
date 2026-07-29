@@ -1,0 +1,15 @@
+{
+  "assignment": "source-slot-v1",
+  "codex_validation_policy": "codex-quality-v2-warn",
+  "completed_rows": 421,
+  "model": "codex-cli-chatgpt:gpt-5.6-sol",
+  "provider": "openai-codex-cli-chatgpt",
+  "remaining_rows": 149579,
+  "run_instance_id": "cf589efd-de37-4a48-bd77-5239b423936c",
+  "source": "/mnt/c/Users/proxi/pipeline/data/source-snapshot",
+  "source_content_sha256": "060d3b9e43aa6540a8c70759a8260658cecb7d6cb1022955215c2d72b6151db7",
+  "source_rows": 94334,
+  "synchronization": "disabled",
+  "target_rows": 150000,
+  "validation_policy": "quality-v1"
+}

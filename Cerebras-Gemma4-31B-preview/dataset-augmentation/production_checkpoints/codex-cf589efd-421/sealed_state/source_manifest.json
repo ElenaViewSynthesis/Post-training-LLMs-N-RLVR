@@ -1,0 +1,61 @@
+{
+  "requested_source": "hf://datasets/open-thoughts/OpenThoughts-Agent-SFT-100K/data/train-*-of-*.parquet",
+  "resolved_source": "/mnt/c/Users/proxi/pipeline/data/source-snapshot",
+  "source_content_sha256": "060d3b9e43aa6540a8c70759a8260658cecb7d6cb1022955215c2d72b6151db7",
+  "source_files": [
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00000-of-00010.parquet",
+      "sha256": "9dd61d89da1c52ec84607ae925150471def1628a2d63237cfdd897ef50860888",
+      "size": 241281937
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00001-of-00010.parquet",
+      "sha256": "b2910bae4fd8575d14bd6e351b787ac3d64da2437331e4d6ebb15eb59c595f3e",
+      "size": 241724750
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00002-of-00010.parquet",
+      "sha256": "9e56768383db8aeb5679fbe337b9aa777c54a1503e1523525fd49625ce4aeb8a",
+      "size": 198767586
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00003-of-00010.parquet",
+      "sha256": "ce6b27eb7f8a8b8b68e6e8e97eff1c354ade72fe4adeef3feec8fe305112557e",
+      "size": 113388327
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00004-of-00010.parquet",
+      "sha256": "c55f36daadcea0528d291f600fe13c34cbf9bbd1d4117f6eb80948b9359d2a74",
+      "size": 115260502
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00005-of-00010.parquet",
+      "sha256": "fa910443b6cd58c58ec514a9f0bd79cbbe7b91d8dc6b0715f42e7139e37a512b",
+      "size": 164252566
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00006-of-00010.parquet",
+      "sha256": "d0bbba7da55df05314a7f7a4e0b84b5afdce0f78ed8d2065896706a252f880d0",
+      "size": 168345151
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00007-of-00010.parquet",
+      "sha256": "118d6d38ac1f0c25091f8419e0ffd05f306bbe2fcc70a03fa3f7dac69ae38f66",
+      "size": 152168832
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00008-of-00010.parquet",
+      "sha256": "015a1a675fcfb36e2e74efff3b5bcf1e66ee25697ca982f8847ad1a5d79c0d56",
+      "size": 228388868
+    },
+    {
+      "path": "datasets/open-thoughts/OpenThoughts-Agent-SFT-100K@45fb28fcc38d352133cb28a1c8a43a2f14fea97b/data/train-00009-of-00010.parquet",
+      "sha256": "d0b92fb8411349980cf32f1d92034c279cd1dc793d4a4ca3d9e0e4d0b4cdc079",
+      "size": 125920337
+    }
+  ],
+  "source_identity_sha256": "66deca657c40a051334d6e7e30d489a25c3c173e3810127607957e678d76393f",
+  "source_rows": 94334,
+  "source_schema_sha256": "894071cda14b15ba48a1171c0611d858632419b5c6ec0e114417ad47e2d90f6d",
+  "version": 2
+}

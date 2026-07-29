@@ -397,6 +397,16 @@ cursor is stored beside the production output in
 This checkpoint namespace is a recovery stream for accepted synthetic rows. It
 is separate from the final Stage 6 publication and never deletes remote files.
 
+#### Published production checkpoint
+
+The production run was gracefully paused at 421 accepted rows. The repository
+contains a reviewable snapshot with every accepted row, the sealed worker
+metadata, checksums, and fresh-terminal resume commands:
+
+- [421-row checkpoint manifest](production_checkpoints/codex-cf589efd-421/checkpoint_manifest.json)
+- [all accepted rows as JSON Lines](production_checkpoints/codex-cf589efd-421/accepted_rows.jsonl)
+- [verification and resume instructions](production_checkpoints/codex-cf589efd-421/RESUME.md)
+
 ### Supported pilot harness
 
 `refinement_pilot.py` deterministically selects 10–50 rows into its own local
