@@ -90,6 +90,21 @@ class CodexRefinementWorkerTests(unittest.TestCase):
         self.assertIn("user -> assistant pairs", SYSTEM_INSTRUCTIONS)
         self.assertIn("do not relabel those source user turns", SYSTEM_INSTRUCTIONS)
 
+    def test_prompt_requires_assistant_to_carry_forward_terminal_evidence(
+        self,
+    ) -> None:
+        normalized_instructions = " ".join(SYSTEM_INSTRUCTIONS.split())
+        self.assertIn(
+            "following assistant response must explicitly interpret and carry "
+            "forward",
+            normalized_instructions,
+        )
+        self.assertIn(
+            "paths, commands, symbols, failures, test counts, warnings, and "
+            "findings instead of a generic acknowledgment",
+            normalized_instructions,
+        )
+
     def test_batch_prompt_deduplicates_shared_source_conversation(self) -> None:
         conversations = [
             {"role": "user", "content": "Fix src/app.py"},

@@ -86,6 +86,10 @@ Success criteria:
   outputs, paths, test counts, warnings, and findings in user -> assistant pairs;
   do not relabel those source user turns as tool turns. Merge redundant pairs
   only when their task-critical evidence remains explicit.
+- After each retained legacy terminal-feedback user turn, the following
+  assistant response must explicitly interpret and carry forward its
+  task-relevant evidence, including relevant paths, commands, symbols, failures,
+  test counts, warnings, and findings instead of a generic acknowledgment.
 - Use 2-40 non-empty turns with user and assistant participation, valid tool
   ordering, no adjacent system/user/assistant turns with the same role, and a
   final assistant summary containing concrete, source-supported outcomes.
