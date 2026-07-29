@@ -69,8 +69,9 @@ CODEX_VALIDATION_POLICY_VERSION = "codex-quality-v1"
 
 SYSTEM_INSTRUCTIONS = """Role: expert software-agent dataset editor.
 
-Goal: for every input item, produce one distinct, higher-quality trajectory for
-the exact same task, requested deliverable, and supported outcome.
+Goal: for every refinement request, produce one distinct, higher-quality
+trajectory for the exact same task, requested deliverable, and supported
+outcome. Resolve each request's source_record_id against the sources array.
 
 Success criteria:
 - Preserve paths, identifiers, commands, URLs, quoted strings, numbers, tool
@@ -79,6 +80,12 @@ Success criteria:
   between assistant actions and tool observations.
 - Retain source tool evidence as tool turns; do not replace concrete evidence
   or findings with generic claims that inspection or work was completed.
+- Preserve the source interaction protocol. In this dataset, terminal output,
+  warnings, grader prompts, and current-terminal-state updates may be encoded as
+  user turns followed by assistant reactions. Keep their concrete commands,
+  outputs, paths, test counts, warnings, and findings in user -> assistant pairs;
+  do not relabel those source user turns as tool turns. Merge redundant pairs
+  only when their task-critical evidence remains explicit.
 - Use 2-40 non-empty turns with user and assistant participation, valid tool
   ordering, no adjacent system/user/assistant turns with the same role, and a
   final assistant summary containing concrete, source-supported outcomes.
@@ -88,8 +95,9 @@ commands, browse, call tools, or access the network. Do not add a summary,
 report, explanation, recommendation, comparison, documentation, or any other
 deliverable absent from the source request. Do not invent execution or results.
 
-Output exactly one result for every supplied synthetic_id and only data that
-matches the requested JSON schema."""
+If multiple requests reference one source, create distinct refinements without
+inventing different facts. Output exactly one result for every requested
+synthetic_id and only data that matches the requested JSON schema."""
 
 _DELIVERABLE_CONCEPTS = {
     "summary": ("summary", "summarize", "summarise"),
@@ -466,7 +474,8 @@ def build_output_schema(items: Sequence[PendingItem]) -> dict[str, Any]:
 
 
 def build_batch_prompt(items: Sequence[PendingItem]) -> str:
-    inputs: list[dict[str, Any]] = []
+    sources_by_id: dict[str, dict[str, Any]] = {}
+    requests: list[dict[str, Any]] = []
     for item in items:
         conversations = normalize_conversations(
             item.source_row.get("conversations"),
@@ -475,16 +484,30 @@ def build_batch_prompt(items: Sequence[PendingItem]) -> str:
             min_turns=1,
             max_turns=None,
         )
-        inputs.append(
+        source_record_id = item.slot.source_record_id
+        source = {
+            "source_record_id": source_record_id,
+            "task": item.slot.source_task_id,
+            "source_conversations": conversations,
+        }
+        existing = sources_by_id.setdefault(source_record_id, source)
+        if existing != source:
+            raise ValueError(
+                "one source_record_id maps to inconsistent batch source content"
+            )
+        requests.append(
             {
                 "synthetic_id": item.slot.synthetic_id,
+                "source_record_id": source_record_id,
                 "refinement_index": item.slot.refinement_index,
-                "task": item.slot.source_task_id,
-                "source_conversations": conversations,
             }
         )
-    serialized = json.dumps(inputs, ensure_ascii=False, separators=(",", ":"))
-    return f"{SYSTEM_INSTRUCTIONS}\n\nInput items JSON:\n{serialized}"
+    batch = {
+        "sources": list(sources_by_id.values()),
+        "requests": requests,
+    }
+    serialized = json.dumps(batch, ensure_ascii=False, separators=(",", ":"))
+    return f"{SYSTEM_INSTRUCTIONS}\n\nInput batch JSON:\n{serialized}"
 
 
 def _parse_codex_events(stdout: str) -> CodexResponse:
