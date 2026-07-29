@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from unittest import mock
 
@@ -13,6 +14,8 @@ from codex_refinement_worker import (
     CodexResponse,
     CodexRuntime,
     PendingItem,
+    SYSTEM_INSTRUCTIONS,
+    build_batch_prompt,
     parse_args,
     process_batch,
     validate_codex_trajectory_quality,
@@ -56,6 +59,10 @@ def source_row(conversations: list[dict[str, str]]) -> dict:
 
 
 def pending_item(conversations: list[dict[str, str]]) -> PendingItem:
+    return pending_items(conversations)[0]
+
+
+def pending_items(conversations: list[dict[str, str]]) -> list[PendingItem]:
     row = source_row(conversations)
     identity = SourceIdentity(
         source_record_id="source-record",
@@ -68,14 +75,53 @@ def pending_item(conversations: list[dict[str, str]]) -> PendingItem:
         source_run_id="source-run",
         source_task_id="source-task",
     )
-    slot = refinement_slots_for_source(identity, frozenset())[0]
-    return PendingItem(slot=slot, source_row=row)
+    slots = refinement_slots_for_source(
+        identity, frozenset({identity.source_record_id})
+    )
+    return [PendingItem(slot=slot, source_row=row) for slot in slots]
 
 
 class CodexRefinementWorkerTests(unittest.TestCase):
     def test_default_micro_batch_size_is_four(self) -> None:
         self.assertEqual(DEFAULT_BATCH_SIZE, 4)
         self.assertEqual(parse_args([]).batch_size, 4)
+
+    def test_prompt_preserves_legacy_terminal_feedback_envelope(self) -> None:
+        self.assertIn("user -> assistant pairs", SYSTEM_INSTRUCTIONS)
+        self.assertIn("do not relabel those source user turns", SYSTEM_INSTRUCTIONS)
+
+    def test_batch_prompt_deduplicates_shared_source_conversation(self) -> None:
+        conversations = [
+            {"role": "user", "content": "Fix src/app.py"},
+            {"role": "assistant", "content": "I will inspect src/app.py."},
+            {
+                "role": "user",
+                "content": "New Terminal Output: UNIQUE_EVIDENCE_MARKER",
+            },
+            {
+                "role": "assistant",
+                "content": "The output confirms the src/app.py failure.",
+            },
+        ]
+        items = pending_items(conversations)
+
+        prompt = build_batch_prompt(items)
+        payload = json.loads(prompt.split("Input batch JSON:\n", 1)[1])
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(len(payload["sources"]), 1)
+        self.assertEqual(len(payload["requests"]), 2)
+        self.assertEqual(
+            {request["synthetic_id"] for request in payload["requests"]},
+            {item.slot.synthetic_id for item in items},
+        )
+        self.assertTrue(
+            all(
+                request["source_record_id"] == "source-record"
+                for request in payload["requests"]
+            )
+        )
+        self.assertEqual(prompt.count("UNIQUE_EVIDENCE_MARKER"), 1)
 
     def test_codex_policy_rejects_observed_synthetic_pilot_failures(self) -> None:
         source = [
